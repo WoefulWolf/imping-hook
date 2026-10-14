@@ -1,0 +1,32 @@
+[package]
+name = "imping-hook"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+license = "MIT OR Apache-2.0"
+description = "In-process function hooking for the imping modding suite."
+publish = false
+
+[dependencies]
+detour = "=0.10.0"
+# Cross-platform executable-memory allocation and page protection for the
+# injection stub.
+region = "4"
+
+# Flushing the instruction cache after writing the stub. Windows only; other
+# platforms do not need it on x86/x86-64.
+[target.'cfg(windows)'.dependencies.windows-sys]
+version = "0.61"
+features = [
+    "Win32_Foundation",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Threading",
+]
+
+[lints.rust]
+missing_docs = "warn"
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "warn"
+missing_safety_doc = "warn"
