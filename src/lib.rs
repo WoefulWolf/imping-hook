@@ -43,6 +43,7 @@
 
 #![warn(missing_docs)]
 
+mod context;
 mod error;
 mod function;
 mod hook;
@@ -50,6 +51,7 @@ mod inject;
 mod registry;
 mod sys;
 
+pub use crate::context::{Context, Xmm};
 pub use crate::error::{Error, OsError, Result};
 pub use crate::function::{Function, Original};
 pub use crate::hook::{Hook, HookBuilder, HookWith};

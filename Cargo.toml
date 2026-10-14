@@ -13,6 +13,13 @@ detour = "=0.10.0"
 # injection stub.
 region = "4"
 
+# Assembles the register-context injection stub (x86-64 only). Already in the
+# tree via detour; `code_asm` adds the fluent assembler.
+[target.'cfg(target_arch = "x86_64")'.dependencies.iced-x86]
+version = "1"
+default-features = false
+features = ["std", "code_asm"]
+
 # Flushing the instruction cache after writing the stub. Windows only; other
 # platforms do not need it on x86/x86-64.
 [target.'cfg(windows)'.dependencies.windows-sys]
