@@ -43,6 +43,7 @@
 
 #![warn(missing_docs)]
 
+mod batch;
 mod context;
 mod error;
 mod function;
@@ -51,6 +52,7 @@ mod inject;
 mod registry;
 mod sys;
 
+pub use crate::batch::batch;
 pub use crate::context::{Context, Xmm};
 pub use crate::error::{Error, OsError, Result};
 pub use crate::function::{Function, Original};

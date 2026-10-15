@@ -58,7 +58,8 @@ use crate::registry;
 /// # }
 /// ```
 pub struct Hook<F: Function = fn()> {
-    inner: detour::TypedDetour<F>,
+    // Boxed so its address stays put while a `batch` has a change queued.
+    inner: Box<detour::TypedDetour<F>>,
     target: usize,
 }
 
@@ -83,7 +84,8 @@ impl<F: Function> Hook<F> {
     ///
     /// All other threads are suspended whilst the code is patched (see the
     /// [type-level note](Self#thread-safety)). Enabling an already-enabled hook
-    /// does nothing.
+    /// does nothing. Inside a [`batch`](crate::batch) the change is queued and
+    /// applied when the batch ends.
     pub fn enable(&self) -> Result<()> {
         self.toggle(true)
     }
@@ -92,9 +94,41 @@ impl<F: Function> Hook<F> {
     ///
     /// All other threads are suspended whilst the code is restored (see the
     /// [type-level note](Self#thread-safety)). Disabling an already-disabled
-    /// hook does nothing.
+    /// hook does nothing. Inside a [`batch`](crate::batch) the change is queued
+    /// and applied when the batch ends.
     pub fn disable(&self) -> Result<()> {
         self.toggle(false)
+    }
+
+    /// Enables the hook without suspending other threads.
+    ///
+    /// Faster than [`enable`](Self::enable), which has to find and suspend
+    /// every other thread, but nothing stops another thread from running the
+    /// target while it is patched. Takes effect at once, also inside a
+    /// [`batch`](crate::batch), replacing any change queued for this hook.
+    ///
+    /// # Safety
+    ///
+    /// No other thread may execute the patched instructions (the first bytes of
+    /// the target) while they are written, or it may run a half-written
+    /// instruction.
+    pub unsafe fn enable_unsuspended(&self) -> Result<()> {
+        crate::batch::forget(self.target);
+        // SAFETY: forwarded from the caller.
+        unsafe { self.toggle_now(true, detour::Threads::None) }
+    }
+
+    /// Disables the hook without suspending other threads; see
+    /// [`enable_unsuspended`](Self::enable_unsuspended).
+    ///
+    /// # Safety
+    ///
+    /// No other thread may execute the patched instructions while the
+    /// original ones are written back.
+    pub unsafe fn disable_unsuspended(&self) -> Result<()> {
+        crate::batch::forget(self.target);
+        // SAFETY: forwarded from the caller.
+        unsafe { self.toggle_now(false, detour::Threads::None) }
     }
 
     /// Returns whether the hook is currently enabled.
@@ -144,20 +178,34 @@ impl<F: Function> Hook<F> {
     }
 
     /// Enables or disables the hook within a transaction that suspends all
-    /// other threads.
+    /// other threads, or queues the change inside a `batch`.
     fn toggle(&self, enable: bool) -> Result<()> {
-        let mut transaction = detour::Transaction::new();
-        if enable {
-            transaction.enable(&self.inner);
-        } else {
-            transaction.disable(&self.inner);
+        if crate::batch::queue(&*self.inner, self.target, enable) {
+            return Ok(());
         }
         // SAFETY: `Threads::All` suspends every other thread of the process, so
         // none can be executing the patched bytes whilst they are written, and
         // any thread stopped inside them is relocated by the transaction. The
-        // only unsuspended thread is the caller, which must not be executing the
-        // target's prolog itself (documented on `enable`/`disable`).
-        unsafe { transaction.commit(detour::Threads::All) }
+        // only unsuspended thread is the caller, which must not be executing
+        // the target's prolog itself (documented on `enable`/`disable`).
+        unsafe { self.toggle_now(enable, detour::Threads::All) }
+    }
+
+    /// Enables or disables the patch now, in its own transaction.
+    ///
+    /// # Safety
+    ///
+    /// Threads not suspended by `threads` must not execute the patched bytes
+    /// while they are written.
+    unsafe fn toggle_now(&self, enable: bool, threads: detour::Threads<'_>) -> Result<()> {
+        let mut transaction = detour::Transaction::new();
+        if enable {
+            transaction.enable(&*self.inner);
+        } else {
+            transaction.disable(&*self.inner);
+        }
+        // SAFETY: forwarded from the caller.
+        unsafe { transaction.commit(threads) }
             .map_err(|error| Error::from_detour(error, self.target))
     }
 }
@@ -168,7 +216,10 @@ impl<F: Function> Drop for Hook<F> {
         // release the address if the target was restored; if it could not be,
         // its code is still patched (and `detour` leaks the generated code), so
         // the address stays reserved.
-        if self.toggle(false).is_ok() {
+        crate::batch::forget(self.target);
+        // SAFETY: as in `toggle`; the caller must not be executing the target's
+        // prolog while dropping.
+        if unsafe { self.toggle_now(false, detour::Threads::All) }.is_ok() {
             registry::release(self.target);
         }
     }
@@ -239,7 +290,7 @@ impl<F: Function> HookWith<F> {
         // SAFETY: The target and detour share the signature `F`, as required.
         match unsafe { detour::TypedDetour::<F>::new(target_fn, self.detour) } {
             Ok(inner) => Ok(Hook {
-                inner,
+                inner: Box::new(inner),
                 target: address,
             }),
             Err(error) => {

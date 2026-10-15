@@ -225,7 +225,8 @@ fn assemble_context_stub(
 /// never jumps into freed memory. [`leak`](Self::leak) keeps an injection
 /// installed for the rest of the process.
 pub struct Injection {
-    inner: detour::RawDetour,
+    // Boxed so its address stays put while a `batch` has a change queued.
+    inner: Box<detour::RawDetour>,
     // Freed manually, and only once the target no longer jumps to it.
     stub: ManuallyDrop<region::Allocation>,
     // A `*mut Box<ContextFn>` for a register-context injection, else null.
@@ -256,7 +257,8 @@ impl Injection {
     ///
     /// All other threads are suspended whilst the code is patched (see the
     /// [type-level note](Self#thread-safety-and-dropping)). Enabling an
-    /// already-enabled injection does nothing.
+    /// already-enabled injection does nothing. Inside a [`batch`](crate::batch)
+    /// the change is queued and applied when the batch ends.
     pub fn enable(&self) -> Result<()> {
         self.toggle(true)
     }
@@ -264,9 +266,41 @@ impl Injection {
     /// Disables the injection, restoring the original code.
     ///
     /// All other threads are suspended whilst the code is restored. Disabling
-    /// an already-disabled injection does nothing.
+    /// an already-disabled injection does nothing. Inside a [`batch`](crate::batch)
+    /// the change is queued and applied when the batch ends.
     pub fn disable(&self) -> Result<()> {
         self.toggle(false)
+    }
+
+    /// Enables the injection without suspending other threads.
+    ///
+    /// Faster than [`enable`](Self::enable), which has to find and suspend
+    /// every other thread, but nothing stops another thread from running the
+    /// target while it is patched. Takes effect at once, also inside a
+    /// [`batch`](crate::batch), replacing any change queued for this injection.
+    ///
+    /// # Safety
+    ///
+    /// No other thread may execute the patched instructions (the first bytes of
+    /// the target) while they are written, or it may run a half-written
+    /// instruction.
+    pub unsafe fn enable_unsuspended(&self) -> Result<()> {
+        crate::batch::forget(self.target);
+        // SAFETY: forwarded from the caller.
+        unsafe { self.toggle_now(true, detour::Threads::None) }
+    }
+
+    /// Disables the injection without suspending other threads; see
+    /// [`enable_unsuspended`](Self::enable_unsuspended).
+    ///
+    /// # Safety
+    ///
+    /// No other thread may execute the patched instructions while the
+    /// original ones are written back.
+    pub unsafe fn disable_unsuspended(&self) -> Result<()> {
+        crate::batch::forget(self.target);
+        // SAFETY: forwarded from the caller.
+        unsafe { self.toggle_now(false, detour::Threads::None) }
     }
 
     /// Returns whether the injection is currently enabled.
@@ -285,20 +319,34 @@ impl Injection {
     }
 
     /// Enables or disables the injection within a transaction that suspends all
-    /// other threads.
+    /// other threads, or queues the change inside a `batch`.
     fn toggle(&self, enable: bool) -> Result<()> {
-        let mut transaction = detour::Transaction::new();
-        if enable {
-            transaction.enable(&self.inner);
-        } else {
-            transaction.disable(&self.inner);
+        if crate::batch::queue(&*self.inner, self.target, enable) {
+            return Ok(());
         }
         // SAFETY: `Threads::All` suspends every other thread of the process, so
         // none can be executing the patched bytes whilst they are written, and
         // any thread stopped inside them is relocated by the transaction. The
         // only unsuspended thread is the caller, which must not be executing
         // the patched bytes itself.
-        unsafe { transaction.commit(detour::Threads::All) }
+        unsafe { self.toggle_now(enable, detour::Threads::All) }
+    }
+
+    /// Enables or disables the patch now, in its own transaction.
+    ///
+    /// # Safety
+    ///
+    /// Threads not suspended by `threads` must not execute the patched bytes
+    /// while they are written.
+    unsafe fn toggle_now(&self, enable: bool, threads: detour::Threads<'_>) -> Result<()> {
+        let mut transaction = detour::Transaction::new();
+        if enable {
+            transaction.enable(&*self.inner);
+        } else {
+            transaction.disable(&*self.inner);
+        }
+        // SAFETY: forwarded from the caller.
+        unsafe { transaction.commit(threads) }
             .map_err(|error| Error::from_detour(error, self.target))
     }
 
@@ -359,7 +407,7 @@ impl Injection {
         unsafe { sys::flush_instruction_cache(stub_ptr, stub_size)? };
 
         Ok(Injection {
-            inner,
+            inner: Box::new(inner),
             stub: ManuallyDrop::new(stub),
             closure,
             target: address,
@@ -491,7 +539,10 @@ impl Drop for Injection {
         // Only free the stub (and callback) if the target was restored;
         // otherwise it may still jump to the stub, so they are leaked and the
         // address stays reserved (the backend likewise leaks its own code).
-        if self.toggle(false).is_ok() {
+        crate::batch::forget(self.target);
+        // SAFETY: as in `toggle`; the caller must not be executing the patched
+        // bytes while dropping.
+        if unsafe { self.toggle_now(false, detour::Threads::All) }.is_ok() {
             registry::release(self.target);
             // SAFETY: the target no longer jumps to the stub, and neither the
             // stub nor the callback is used again.
