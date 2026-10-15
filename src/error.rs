@@ -60,6 +60,11 @@ pub enum Error {
     /// A thread suspended during a transaction is executing code that cannot be
     /// relocated.
     ThreadNotRelocatable,
+    /// The assembly supplied to an injection could not be encoded.
+    Assembly {
+        /// The address the injection was being built for.
+        address: usize,
+    },
     /// An operating system call (memory protection, or thread suspension)
     /// failed.
     Os(OsError),
@@ -97,6 +102,12 @@ impl fmt::Display for Error {
             }
             Error::ThreadNotRelocatable => {
                 f.write_str("a suspended thread is executing code that cannot be relocated")
+            }
+            Error::Assembly { address } => {
+                write!(
+                    f,
+                    "the assembly for the injection at {address:#x} could not be encoded"
+                )
             }
             Error::Os(_) => f.write_str("an operating system call failed"),
         }

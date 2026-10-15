@@ -56,3 +56,19 @@ pub use crate::error::{Error, OsError, Result};
 pub use crate::function::{Function, Original};
 pub use crate::hook::{Hook, HookBuilder, HookWith};
 pub use crate::inject::{Injection, InjectionBuilder, InjectionWith};
+
+/// The assembler used to author injected code with
+/// [`InjectionBuilder::asm`](crate::InjectionBuilder::asm).
+///
+/// This re-exports [`iced_x86`]'s `code_asm` module — [`CodeAssembler`], the
+/// register constants (`rax`, `xmm0`, …), the memory-operand helpers
+/// (`qword_ptr`, …) — plus [`IcedError`]. Reference Rust values by passing them
+/// as operands, e.g. `a.mov(rax, some_addr)`.
+///
+/// [`CodeAssembler`]: iced_x86::code_asm::CodeAssembler
+/// [`IcedError`]: iced_x86::IcedError
+#[cfg(target_arch = "x86_64")]
+pub mod asm {
+    pub use iced_x86::IcedError;
+    pub use iced_x86::code_asm::*;
+}

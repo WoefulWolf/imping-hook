@@ -50,6 +50,15 @@ fn absolute_jump(target: usize) -> [u8; ABS_JUMP_LEN] {
 #[cfg(target_arch = "x86_64")]
 type ContextFn = dyn Fn(&mut Context) + Send + Sync;
 
+/// A boxed assembly builder (see [`InjectionBuilder::asm`]), run once at install
+/// to author the injected code.
+#[cfg(target_arch = "x86_64")]
+type BoxedAsm = Box<
+    dyn FnOnce(
+        &mut iced_x86::code_asm::CodeAssembler,
+    ) -> core::result::Result<(), iced_x86::IcedError>,
+>;
+
 /// A generous upper bound on the assembled size of a register-context stub.
 /// The real stub is a few hundred bytes; the allocation is page-rounded anyway.
 #[cfg(target_arch = "x86_64")]
@@ -305,7 +314,7 @@ impl Injection {
         target: *const (),
         capacity: usize,
         closure: *mut (),
-        render: impl FnOnce(usize) -> Vec<u8>,
+        render: impl FnOnce(usize, usize) -> Vec<u8>,
     ) -> Result<Injection> {
         let address = target as usize;
 
@@ -329,7 +338,7 @@ impl Injection {
             .map_err(|error| Error::from_detour(error, address))?;
         let trampoline = inner.trampoline() as usize;
 
-        let bytes = render(trampoline);
+        let bytes = render(stub_ptr as usize, trampoline);
         assert!(
             bytes.len() <= stub_size,
             "imping-hook: injection stub exceeded its allocation"
@@ -367,11 +376,16 @@ impl Injection {
         let capacity = code.len() + ABS_JUMP_LEN;
         // SAFETY: forwarded from the caller.
         unsafe {
-            Self::install_stub(target, capacity, ptr::null_mut(), move |trampoline| {
-                let mut bytes = code;
-                bytes.extend_from_slice(&absolute_jump(trampoline));
-                bytes
-            })
+            Self::install_stub(
+                target,
+                capacity,
+                ptr::null_mut(),
+                move |_stub, trampoline| {
+                    let mut bytes = code;
+                    bytes.extend_from_slice(&absolute_jump(trampoline));
+                    bytes
+                },
+            )
         }
     }
 
@@ -395,7 +409,7 @@ impl Injection {
                 target,
                 CONTEXT_STUB_CAPACITY,
                 closure_ptr.cast(),
-                |continue_at| {
+                |_stub, continue_at| {
                     assemble_context_stub(
                         hook_addr,
                         closure_ptr as u64,
@@ -412,6 +426,48 @@ impl Injection {
             drop(unsafe { Box::from_raw(closure_ptr) });
         }
         result
+    }
+
+    /// Builds an injection from assembly authored with iced's `code_asm`.
+    ///
+    /// The user block is assembled at the real stub address (so rip-relative
+    /// operands resolve correctly), followed by a jump to the trampoline.
+    ///
+    /// # Safety
+    ///
+    /// See [`InjectionWith::install`].
+    #[cfg(target_arch = "x86_64")]
+    unsafe fn build_asm(target: *const (), build: BoxedAsm) -> Result<Injection> {
+        use iced_x86::code_asm::CodeAssembler;
+
+        let address = target as usize;
+        let mut assembler = CodeAssembler::new(64).map_err(|_| Error::Assembly { address })?;
+        build(&mut assembler).map_err(|_| Error::Assembly { address })?;
+        // Encode once at a dummy address to size the allocation; the length is
+        // independent of the address (only relative/rip-relative values change).
+        let capacity = assembler
+            .assemble(0)
+            .map_err(|_| Error::Assembly { address })?
+            .len()
+            + ABS_JUMP_LEN;
+
+        // SAFETY: forwarded from the caller.
+        unsafe {
+            Self::install_stub(
+                target,
+                capacity,
+                ptr::null_mut(),
+                move |stub, trampoline| {
+                    // Re-encoding at a different address cannot fail once the first
+                    // encode succeeded, so the expect is an internal invariant.
+                    let mut bytes = assembler
+                        .assemble(stub as u64)
+                        .expect("imping-hook: internal error reassembling injected asm");
+                    bytes.extend_from_slice(&absolute_jump(trampoline));
+                    bytes
+                },
+            )
+        }
     }
 }
 
@@ -445,10 +501,12 @@ impl core::fmt::Debug for Injection {
     }
 }
 
-/// The payload of an [`InjectionWith`]: raw bytes or a register-context
-/// callback.
+/// The payload of an [`InjectionWith`]: raw bytes, an assembly builder, or a
+/// register-context callback.
 enum Payload {
     Bytes(Vec<u8>),
+    #[cfg(target_arch = "x86_64")]
+    Asm(BoxedAsm),
     #[cfg(target_arch = "x86_64")]
     Context(Box<ContextFn>),
 }
@@ -470,6 +528,31 @@ impl InjectionBuilder {
         InjectionWith {
             target: self.target,
             payload: Payload::Bytes(code.to_vec()),
+        }
+    }
+
+    /// Injects machine code authored as assembly.
+    ///
+    /// `build` receives an [`asm::CodeAssembler`](crate::asm::CodeAssembler) to
+    /// append instructions to; reference Rust values by passing them as operands
+    /// (e.g. `a.mov(rax, some_addr)`). The block is assembled at install time at
+    /// the real stub address, so rip-relative operands resolve correctly, and a
+    /// jump back to the original code is appended automatically.
+    ///
+    /// The same ABI obligations as [`code`](Self::code) apply: preserve the
+    /// registers and flags the surrounding function relies on, keep the stack
+    /// balanced, and do not branch into the displaced bytes.
+    #[cfg(target_arch = "x86_64")]
+    pub fn asm<F>(self, build: F) -> InjectionWith
+    where
+        F: FnOnce(
+                &mut crate::asm::CodeAssembler,
+            ) -> core::result::Result<(), crate::asm::IcedError>
+            + 'static,
+    {
+        InjectionWith {
+            target: self.target,
+            payload: Payload::Asm(Box::new(build)),
         }
     }
 
@@ -530,12 +613,12 @@ impl InjectionWith {
     /// - `target` must point to executable code whose first bytes can be
     ///   relocated (as for any inline patch), and which it is valid to resume
     ///   after the injected work runs.
-    /// - For [`code`](InjectionBuilder::code): the bytes must be valid machine
-    ///   code that honours the platform ABI — preserve every register and flag
-    ///   the surrounding function relies on, keep the stack balanced and aligned
-    ///   (reserving shadow space before any `call` on Windows x64), and not
-    ///   branch into the displaced bytes. (The register-context callbacks handle
-    ///   this for you.)
+    /// - For [`code`](InjectionBuilder::code) and
+    ///   [`asm`](InjectionBuilder::asm): the injected code must honour the
+    ///   platform ABI — preserve every register and flag the surrounding
+    ///   function relies on, keep the stack balanced and aligned (reserving
+    ///   shadow space before any `call` on Windows x64), and not branch into the
+    ///   displaced bytes. (The register-context callbacks handle this for you.)
     pub unsafe fn install(self) -> Result<Injection> {
         let address = self.target as usize;
 
@@ -547,6 +630,9 @@ impl InjectionWith {
         let result = match self.payload {
             // SAFETY: forwarded from the caller.
             Payload::Bytes(code) => unsafe { Injection::build_bytes(self.target, code) },
+            #[cfg(target_arch = "x86_64")]
+            // SAFETY: forwarded from the caller.
+            Payload::Asm(build) => unsafe { Injection::build_asm(self.target, build) },
             #[cfg(target_arch = "x86_64")]
             // SAFETY: forwarded from the caller.
             Payload::Context(callback) => unsafe {
