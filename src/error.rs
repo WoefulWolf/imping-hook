@@ -64,6 +64,9 @@ pub enum Error {
     Assembly {
         /// The address the injection was being built for.
         address: usize,
+        /// The assembler's description of the failure (for an invalid
+        /// instruction, prefixed with its position in the sequence).
+        reason: String,
     },
     /// An operating system call (memory protection, or thread suspension)
     /// failed.
@@ -103,10 +106,10 @@ impl fmt::Display for Error {
             Error::ThreadNotRelocatable => {
                 f.write_str("a suspended thread is executing code that cannot be relocated")
             }
-            Error::Assembly { address } => {
+            Error::Assembly { address, reason } => {
                 write!(
                     f,
-                    "the assembly for the injection at {address:#x} could not be encoded"
+                    "the assembly for the injection at {address:#x} could not be encoded: {reason}"
                 )
             }
             Error::Os(_) => f.write_str("an operating system call failed"),

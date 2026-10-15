@@ -97,7 +97,17 @@ fn asm_that_cannot_be_encoded_is_reported() {
             })
             .install()
     };
-    assert!(matches!(result, Err(Error::Assembly { .. })));
+    match result {
+        Err(Error::Assembly { reason, .. }) => {
+            // The iced diagnostic is carried through, prefixed with the position.
+            assert!(
+                reason.starts_with("instruction 0:"),
+                "reason was {reason:?}"
+            );
+            assert!(reason.len() > "instruction 0:".len());
+        }
+        other => panic!("expected an assembly error, got {other:?}"),
+    }
 
     // The failed install must not leave the address reserved.
     static FLAG: AtomicU8 = AtomicU8::new(0);

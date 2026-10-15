@@ -441,13 +441,27 @@ impl Injection {
         use iced_x86::code_asm::CodeAssembler;
 
         let address = target as usize;
-        let mut assembler = CodeAssembler::new(64).map_err(|_| Error::Assembly { address })?;
-        build(&mut assembler).map_err(|_| Error::Assembly { address })?;
+        let mut assembler = CodeAssembler::new(64).map_err(|error| Error::Assembly {
+            address,
+            reason: error.to_string(),
+        })?;
+        if let Err(error) = build(&mut assembler) {
+            // The failing instruction was not added, so the number already added
+            // is its zero-based position.
+            let index = assembler.instructions().len();
+            return Err(Error::Assembly {
+                address,
+                reason: format!("instruction {index}: {error}"),
+            });
+        }
         // Encode once at a dummy address to size the allocation; the length is
         // independent of the address (only relative/rip-relative values change).
         let capacity = assembler
             .assemble(0)
-            .map_err(|_| Error::Assembly { address })?
+            .map_err(|error| Error::Assembly {
+                address,
+                reason: error.to_string(),
+            })?
             .len()
             + ABS_JUMP_LEN;
 
