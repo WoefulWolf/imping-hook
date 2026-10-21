@@ -8,27 +8,22 @@ mod sealed {
     impl<F: detour::Function> Sealed for F {}
 }
 
-/// A function pointer whose signature can be used as a [`Hook`](crate::Hook)
-/// target and detour.
+/// A function pointer type that can be a [`Hook`](crate::Hook) target and
+/// detour.
 ///
-/// It is implemented for all function-pointer types the backend supports:
-/// every calling convention available on the platform (e.g. `extern "C"`,
-/// `extern "system"`, and, on x86, `extern "fastcall"` and
-/// `extern "thiscall"`), with up to 14 arguments, in both `unsafe` and safe
-/// form.
-///
-/// Signatures that borrow their arguments or return values (e.g. `fn(&str)`)
-/// are not supported, since game functions use C-compatible ABIs over plain
-/// data. This trait is sealed and cannot be implemented outside this crate.
+/// Implemented for safe and `unsafe` function pointers with up to 14 arguments
+/// in every calling convention the platform has, such as `extern "C"`,
+/// `extern "system"`, and on x86 `extern "fastcall"` and `extern "thiscall"`.
+/// Signatures with borrows, such as `fn(&str)`, aren't supported. The trait is
+/// sealed.
 pub trait Function: sealed::Sealed + detour::Function {}
 
 impl<F: detour::Function> Function for F {}
 
-/// The original, un-hooked function of a [`Hook`](crate::Hook), borrowed from
+/// The original, unhooked function of a [`Hook`](crate::Hook), borrowed from
 /// it.
 ///
-/// Returned by [`Hook::original`](crate::Hook::original). Its `call` method
-/// takes the same arguments as the hooked function, and is `unsafe` whenever
-/// the signature is an `unsafe` function. It cannot outlive the hook it was
-/// borrowed from, so calling it can never use freed trampoline memory.
+/// Its `call` method takes the hooked function's arguments and is `unsafe` when
+/// the signature is. It can't outlive the hook, so it never runs freed
+/// trampoline memory.
 pub use detour::Original;

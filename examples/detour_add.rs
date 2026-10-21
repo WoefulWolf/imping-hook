@@ -14,8 +14,8 @@ extern "C" fn sub(a: i32, b: i32) -> i32 {
 }
 
 fn main() -> imping_hook::Result<()> {
-    // SAFETY: `add` is a real function with the signature declared below, and
-    // `sub` shares that signature and calling convention.
+    // SAFETY: `add` is a real function with the signature below, and `sub`
+    // shares it.
     let hook = unsafe {
         Hook::at(add as *const ())
             .redirect(sub as extern "C" fn(i32, i32) -> i32)

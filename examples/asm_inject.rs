@@ -16,18 +16,18 @@ fn main() -> imping_hook::Result<()> {
         std::hint::black_box(x) + 1
     }
 
-    // The address of a Rust value, embedded into the assembly as an immediate.
+    // Passed to the assembly as an immediate.
     let flag = &CALLED as *const AtomicU8 as u64;
 
-    // SAFETY: `target` is a real function whose entry can be relocated; the
-    // assembly preserves every register and flag the function relies on.
+    // SAFETY: `target` is a real function whose entry can be relocated, and the
+    // assembly preserves every register and flag it relies on.
     let injection = unsafe {
         Injection::at(target as *const ())
             .asm(move |a| {
-                a.push(rax)?; // save rax
+                a.push(rax)?;
                 a.mov(rax, flag)?; // rax = &CALLED
                 a.mov(byte_ptr(rax), 1i32)?; // CALLED = 1
-                a.pop(rax)?; // restore rax
+                a.pop(rax)?;
                 Ok(())
             })
             .install()?

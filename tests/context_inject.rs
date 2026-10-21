@@ -31,7 +31,6 @@ fn inspect_reads_argument_registers() {
     };
 
     injection.enable().expect("enable");
-    // The function still computes its normal result (inspect is transparent).
     assert_eq!(two_args(0x1111, 0x2222), 0x3333);
     assert_eq!(RCX.load(Ordering::SeqCst), 0x1111);
     assert_eq!(RDX.load(Ordering::SeqCst), 0x2222);
@@ -67,8 +66,8 @@ extern "C" fn add_one(x: u64) -> u64 {
 
 #[test]
 fn modify_changes_a_register_on_the_continue_path() {
-    // Overwrite the first argument (rcx) before the original code reads it.
-    // SAFETY: real function; the callback writes a GPR the function then uses.
+    // Overwrite the first argument before the original reads it.
+    // SAFETY: real function; the callback writes a register the function uses.
     let injection = unsafe {
         Injection::at(add_one as *const ())
             .modify(|ctx| ctx.rcx = 100)
@@ -134,7 +133,7 @@ fn drop_reverts_injection() {
         assert_eq!(drop_probe(), 5);
         assert_eq!(HITS.load(Ordering::SeqCst), 1);
     }
-    // After the guard is dropped, the callback no longer fires.
+    // Dropped, so the callback no longer fires.
     assert_eq!(drop_probe(), 5);
     assert_eq!(HITS.load(Ordering::SeqCst), 1);
 }
@@ -148,12 +147,11 @@ extern "C" fn mt_probe(x: u64) -> u64 {
 fn multithreaded_inspect() {
     static HITS: AtomicU64 = AtomicU64::new(0);
 
-    // SAFETY: real function; the callback is Send + Sync and only touches an
-    // atomic, so concurrent invocations are safe.
+    // SAFETY: real function; the callback only reads the context and bumps an
+    // atomic, so it can run on several threads at once.
     let injection = unsafe {
         Injection::at(mt_probe as *const ())
             .inspect(|ctx| {
-                // Observe the argument and count the hit.
                 assert_eq!(ctx.rcx, 21);
                 HITS.fetch_add(1, Ordering::SeqCst);
             })
@@ -197,11 +195,10 @@ extern "C" fn roundtrip(x: u64) -> u64 {
 
 #[test]
 fn captures_a_value_in_and_reads_observations_out() {
-    // Read out: a shared buffer the callback pushes into and we read afterward,
-    // kept alive by an `Arc` (no global, no static).
+    // Observations come back out through an `Arc`, no static needed.
     let observed: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
     let sink = Arc::clone(&observed);
-    // Move in: a value the callback writes into the first argument register.
+    // Moved into the callback, which writes it to the first argument.
     let forced: u64 = 100;
 
     // SAFETY: `roundtrip` is a real function whose entry can be relocated; the
@@ -209,8 +206,8 @@ fn captures_a_value_in_and_reads_observations_out() {
     let injection = unsafe {
         Injection::at(roundtrip as *const ())
             .modify(move |ctx| {
-                sink.lock().unwrap().push(ctx.rcx); // read out: the original arg
-                ctx.rcx = forced; // move in: overwrite the arg
+                sink.lock().unwrap().push(ctx.rcx); // the original argument
+                ctx.rcx = forced;
             })
             .install()
             .expect("install")
@@ -221,6 +218,5 @@ fn captures_a_value_in_and_reads_observations_out() {
     assert_eq!(roundtrip(7), 101);
     injection.disable().expect("disable");
 
-    // The original arguments made it back out through the Arc.
     assert_eq!(*observed.lock().unwrap(), vec![5, 7]);
 }

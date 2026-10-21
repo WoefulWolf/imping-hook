@@ -1,9 +1,7 @@
 //! Committing many enables and disables in one transaction.
 //!
-//! Every transaction suspends all other threads, and finding them can take tens
-//! of milliseconds on a busy system, so patches applied one at a time add up.
-//! Inside [`batch`], enables and disables on the calling thread are queued and
-//! committed together once the closure returns.
+//! Each transaction suspends every other thread, and finding them can take
+//! tens of milliseconds on a busy system, so one transaction per patch adds up.
 
 use crate::error::{Error, Result};
 use std::cell::Cell;
@@ -21,14 +19,14 @@ struct Pending {
     enable: bool,
 }
 
-// SAFETY: the pointer is only dereferenced while `QUEUE` is locked, and an
-// owner removes its entries (taking the same lock) before freeing the detour,
-// which is `Sync`.
+// SAFETY: the pointer is only dereferenced under the `QUEUE` lock, and owners
+// remove their entries under that lock before freeing the (Sync) detour.
 unsafe impl Send for Pending {}
 
-/// Changes queued by every thread currently in a [`batch`]. Kept in one place
-/// so that a patch dropped on any thread removes its entries, and locked while
-/// changes are committed so that it can't be freed meanwhile.
+/// Changes queued by every thread in a [`batch`].
+///
+/// Shared so a patch dropped on any thread can remove its entries, and locked
+/// during a commit so no detour is freed meanwhile.
 static QUEUE: Mutex<Vec<Pending>> = Mutex::new(Vec::new());
 
 thread_local! {
@@ -37,27 +35,26 @@ thread_local! {
 }
 
 fn lock() -> MutexGuard<'static, Vec<Pending>> {
-    // A panic while locked leaves the queue consistent: entries are only
-    // pushed or removed whole.
+    // Poisoning is harmless: entries are only pushed or removed whole.
     QUEUE
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Runs `f`, committing every enable and disable it makes on this thread in
-/// one transaction when it returns, so other threads are suspended once
-/// instead of once per patch.
+/// Runs `f`, then applies the enables and disables it made on this thread in
+/// one transaction, so other threads are suspended once rather than per patch.
 ///
-/// Inside the closure, `enable` and `disable` of [`Injection`](crate::Injection)
-/// and [`Hook`](crate::Hook) are queued and return `Ok` at once, and
-/// `is_enabled` reports the state before the batch. The last change queued for
-/// a patch wins. A `batch` inside another joins it. Only the calling thread's
-/// changes are queued; other threads apply theirs as usual. If the closure
-/// panics, the queued changes are still committed before the panic continues.
+/// Inside `f`, `enable` and `disable` on a [`Hook`](crate::Hook) or
+/// [`Injection`](crate::Injection) are queued and return `Ok` at once, and
+/// `is_enabled` still reports the old state. The last change queued for a
+/// patch wins, a nested `batch` joins the outer one, and other threads aren't
+/// affected. If `f` panics, the queue is still applied before the panic goes on.
 ///
-/// Returns the errors of changes that could not be applied, each naming its
-/// address. If committing everything together fails, each change is tried on
-/// its own, so one bad patch doesn't hold back the rest.
+/// Returns an error, naming the address, for each change that couldn't be
+/// applied. If applying them together fails, each is retried alone, so one bad
+/// patch doesn't hold back the rest.
+///
+/// # Examples
 ///
 /// ```no_run
 /// use imping_hook::Injection;
@@ -87,7 +84,7 @@ pub fn batch(f: impl FnOnce()) -> Vec<Error> {
     guard.finish()
 }
 
-/// Commits this thread's queue when the outermost `batch` ends, also when
+/// Applies this thread's queue when the outermost `batch` ends, even when
 /// unwinding.
 struct Commit;
 
@@ -105,8 +102,8 @@ impl Drop for Commit {
     }
 }
 
-/// Queues a change if this thread is in a batch. Returns `false` when it isn't,
-/// and the caller applies the change itself.
+/// Queues a change if this thread is in a batch, or returns `false` so the
+/// caller applies it itself.
 pub(crate) fn queue(detour: &(dyn detour::Detour + 'static), target: usize, enable: bool) -> bool {
     if !BATCHING.with(Cell::get) {
         return false;
@@ -123,8 +120,10 @@ pub(crate) fn queue(detour: &(dyn detour::Detour + 'static), target: usize, enab
     true
 }
 
-/// Drops every change queued for `target` by any thread, before its detour is
-/// freed or when a change is applied directly. Waits for a commit in progress.
+/// Drops every change any thread queued for `target`.
+///
+/// Called before its detour is freed or a change is applied directly. Waits for
+/// a commit in progress.
 pub(crate) fn forget(target: usize) {
     lock().retain(|p| p.target != target);
 }
@@ -140,12 +139,11 @@ fn commit_current_thread() -> Vec<Error> {
     if mine.is_empty() {
         return Vec::new();
     }
-    // The lock stays held until the changes are applied, so no owner can free
-    // a detour in the meantime.
+    // Hold the lock until everything is applied so no owner frees a detour.
     let mut transaction = detour::Transaction::new();
     for p in &mine {
-        // SAFETY: owners remove their entries (under this lock) before freeing
-        // the detour, which they keep boxed, so every queued pointer is valid.
+        // SAFETY: owners remove their entries under this lock before freeing
+        // their boxed detour, so every queued pointer is live.
         let detour = unsafe { &*p.detour };
         if p.enable {
             transaction.enable(detour);
@@ -153,8 +151,8 @@ fn commit_current_thread() -> Vec<Error> {
             transaction.disable(detour);
         }
     }
-    // SAFETY: as for a single change: `Threads::All` suspends every other
-    // thread, and the caller must not be executing the patched bytes.
+    // SAFETY: `Threads::All` suspends every other thread, and the caller isn't
+    // running the patched bytes.
     if unsafe { transaction.commit(detour::Threads::All) }.is_ok() {
         return Vec::new();
     }

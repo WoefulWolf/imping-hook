@@ -26,9 +26,8 @@ fn main() -> imping_hook::Result<()> {
         let builder = Injection::at(target).modify(|_| {
             CALLS.fetch_add(1, Ordering::Relaxed);
         });
-        // SAFETY: both targets are real functions of this program, and the
-        // callback only increments `CALLS`; the stub saves and restores every
-        // register around it.
+        // SAFETY: both targets are real functions, and the stub saves and
+        // restores every register around the callback.
         injections.push(unsafe { builder.install() }?);
     }
 

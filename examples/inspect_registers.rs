@@ -12,9 +12,8 @@ fn main() -> imping_hook::Result<()> {
         std::hint::black_box(a).wrapping_add(std::hint::black_box(b))
     }
 
-    // Read-only: observe the argument registers (Win64 passes them in rcx/rdx).
-    // Dropped at the end of the block, which reverts it and frees the address
-    // so the next injection can use it.
+    // Win64 passes the first two arguments in rcx and rdx. The block drops the
+    // injection, which frees the address for the next one.
     {
         // SAFETY: `compute` is a real function whose entry can be relocated.
         let inspect = unsafe {
@@ -26,8 +25,8 @@ fn main() -> imping_hook::Result<()> {
         println!("compute(2, 3) = {}", compute(2, 3));
     }
 
-    // Mutable: force the first argument to 40 before the original runs.
-    // SAFETY: as above; the callback writes a GPR the function then reads.
+    // Force the first argument to 40 before the original runs.
+    // SAFETY: as above; the callback writes a register the function then reads.
     let modify = unsafe {
         Injection::at(compute as *const ())
             .modify(|ctx| ctx.rcx = 40)

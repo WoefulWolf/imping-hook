@@ -16,9 +16,8 @@ fn asm_references_a_rust_value_and_original_continues() {
     static FLAG: AtomicU8 = AtomicU8::new(0);
     let flag_addr = &FLAG as *const AtomicU8 as u64;
 
-    // push rax; mov rax, <FLAG addr>; mov byte [rax], 1; pop rax.
-    // Preserves rax and the flags, and touches no argument register, so the
-    // original function runs unchanged while the flag records that we ran.
+    // Preserves rax and the flags and touches no argument register, so the
+    // original runs unchanged while FLAG records that the injection ran.
     // SAFETY: `add_one` is a real function whose entry can be relocated, and the
     // assembly preserves every register and flag it relies on.
     let injection = unsafe {
@@ -86,8 +85,7 @@ extern "C" fn invalid_target() -> u64 {
 
 #[test]
 fn asm_that_cannot_be_encoded_is_reported() {
-    // A byte store with an immediate that does not fit in a byte cannot be
-    // encoded, so assembling fails.
+    // 0x1234 doesn't fit a byte store's immediate, so encoding fails.
     // SAFETY: the target is never patched, since assembly fails first.
     let result = unsafe {
         Injection::at(invalid_target as *const ())
@@ -99,7 +97,7 @@ fn asm_that_cannot_be_encoded_is_reported() {
     };
     match result {
         Err(Error::Assembly { reason, .. }) => {
-            // The iced diagnostic is carried through, prefixed with the position.
+            // iced's message, prefixed with the instruction's position.
             assert!(
                 reason.starts_with("instruction 0:"),
                 "reason was {reason:?}"

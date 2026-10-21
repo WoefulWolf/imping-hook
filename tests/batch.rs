@@ -3,8 +3,7 @@
 use imping_hook::{Hook, Injection, batch};
 use std::hint::black_box;
 
-// Each test uses its own target functions so that tests, which share the
-// process-wide hook registry, never contend for the same address.
+// Each test hooks its own functions, since all tests share one hook registry.
 
 macro_rules! targets {
     ($($name:ident => $value:expr),* $(,)?) => {
@@ -33,7 +32,7 @@ extern "C" fn forty_two() -> i32 {
     42
 }
 
-/// A typed hook redirecting `target` to `forty_two`.
+/// Installs a hook redirecting `target` to `forty_two`.
 fn hook(target: extern "C" fn() -> i32) -> Hook<extern "C" fn() -> i32> {
     // SAFETY: every target here is a real `extern "C" fn() -> i32`, as is the
     // detour.
@@ -45,7 +44,7 @@ fn hook(target: extern "C" fn() -> i32) -> Hook<extern "C" fn() -> i32> {
     }
 }
 
-/// An injection running a `nop` before `target`'s own code.
+/// Installs an injection that runs a `nop` before `target`.
 fn injection(target: extern "C" fn() -> i32) -> Injection {
     // SAFETY: the target is a real function whose entry can be relocated, and a
     // `nop` changes nothing it relies on.

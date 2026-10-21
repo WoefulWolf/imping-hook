@@ -6,8 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
-// Each test uses its own target function so that tests, which share the
-// process-wide hook registry, never contend for the same address.
+// Each test hooks its own function, since all tests share one hook registry.
 
 #[inline(never)]
 extern "C" fn basic_value() -> i32 {
@@ -35,7 +34,6 @@ fn enable_disable_and_original() {
     hook.enable().expect("enable");
     assert!(hook.is_enabled());
     assert_eq!(basic_value(), 2);
-    // The original is still reachable through the hook.
     assert_eq!(hook.original().call(), 1);
 
     hook.disable().expect("disable");
@@ -70,7 +68,7 @@ fn second_hook_on_same_address_is_refused() {
     };
     assert!(matches!(second, Err(Error::AlreadyHooked { .. })));
 
-    // Dropping the first frees the address, so it can be hooked again.
+    // Dropping the first frees the address.
     drop(first);
     // SAFETY: real function, shared signature.
     let third = unsafe {
@@ -103,7 +101,6 @@ fn drop_unhooks() {
         hook.enable().expect("enable");
         assert_eq!(drop_value(), 200);
     }
-    // After the guard is dropped the original behaviour is restored.
     assert_eq!(drop_value(), 100);
 }
 
@@ -129,8 +126,7 @@ fn leak_keeps_hook_and_returns_original() {
 
     let original = hook.leak();
 
-    // The hook stays installed for the rest of the process, and the leaked
-    // pointer still reaches the original.
+    // Still hooked, and the leaked pointer still reaches the original.
     assert_eq!(leak_value(), 8);
     assert_eq!(original(), 7);
 }
@@ -184,10 +180,8 @@ fn multithreaded_enable_disable() {
 
     let stop = Arc::new(AtomicBool::new(false));
 
-    // Worker threads hammer the target while the main thread toggles the hook.
-    // With all other threads suspended during each patch, every observed result
-    // must be either the original (1) or the detour (2) — never a torn read or
-    // a crash from resuming inside a half-written jump.
+    // Workers call the target while this thread toggles the hook. A worker
+    // resumed inside a half-written jump would crash or return garbage.
     let workers: Vec<_> = (0..4)
         .map(|_| {
             let stop = Arc::clone(&stop);

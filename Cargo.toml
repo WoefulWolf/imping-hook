@@ -9,19 +9,18 @@ publish = false
 
 [dependencies]
 detour = "=0.10.0"
-# Cross-platform executable-memory allocation and page protection for the
-# injection stub.
+# Allocates and protects the injection stub's memory.
 region = "4"
 
-# Assembles the register-context injection stub (x86-64 only). Already in the
-# tree via detour; `code_asm` adds the fluent assembler.
+# Assembles the context stub and `asm` injections (x86-64 only). Already a
+# dependency of detour; `code_asm` adds the assembler.
 [target.'cfg(target_arch = "x86_64")'.dependencies.iced-x86]
 version = "1"
 default-features = false
 features = ["std", "code_asm"]
 
-# Flushing the instruction cache after writing the stub. Windows only; other
-# platforms do not need it on x86/x86-64.
+# Instruction-cache flush after writing the stub, and GetLastError. Other
+# platforms don't need the flush on x86.
 [target.'cfg(windows)'.dependencies.windows-sys]
 version = "0.61"
 features = [

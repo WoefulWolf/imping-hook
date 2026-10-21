@@ -1,5 +1,4 @@
-//! Typed function detours: redirect a function to another of the same
-//! signature, whilst keeping the original callable.
+//! Typed function detours.
 
 use crate::error::{Error, Result};
 use crate::function::Function;
@@ -7,30 +6,32 @@ use crate::registry;
 
 /// A typed function detour, and the RAII guard that owns it.
 ///
-/// A `Hook` redirects a *target* function to a *detour* of the same signature
-/// `F`. Whilst it is enabled, callers of the target run the detour instead; the
-/// original remains callable through [`original`](Self::original). Build one
-/// with [`Hook::at`].
+/// While enabled, calls to the target run a detour of the same signature `F`
+/// instead; the original stays callable through [`original`](Self::original).
+/// Build one with [`Hook::at`].
 ///
-/// # Thread safety
+/// # Threads
 ///
-/// [`enable`](Self::enable) and [`disable`](Self::disable) are safe: they
-/// suspend every other thread of the process whilst the code is patched, and
-/// move any thread stopped within the patched bytes to the equivalent location,
-/// so no thread can resume in the middle of a half-written jump. The one
-/// obligation left to the caller is not to enable or disable a hook from within
-/// its own target on the *calling* thread.
+/// [`enable`](Self::enable), [`disable`](Self::disable) and drop suspend every
+/// other thread while patching and move any thread stopped inside the patched
+/// bytes, so hooks can be toggled in a running, multi-threaded process. Don't
+/// toggle or drop a hook from inside its own target on the same thread. The
+/// `unsafe` `*_unsuspended` methods skip the suspension.
+///
+/// # Batches
+///
+/// Inside [`batch`](crate::batch), `enable` and `disable` are queued and
+/// applied together when the batch ends. The `*_unsuspended` methods apply at
+/// once even there, and replace any change queued for the same hook.
 ///
 /// # Dropping
 ///
-/// When a `Hook` is dropped it is disabled (again suspending other threads) and
-/// its generated code is released. If it cannot be disabled — for instance
-/// because a third party modified the target's bytes — the generated code is
-/// leaked instead, so the target never jumps into freed memory. Use
-/// [`leak`](Self::leak) to keep a hook installed for the rest of the process on
-/// purpose.
+/// Dropping a hook disables it and frees its generated code. If it can't be
+/// disabled, say because a third party rewrote the target, the code is leaked
+/// instead so the target never jumps into freed memory. [`leak`](Self::leak)
+/// keeps a hook installed on purpose.
 ///
-/// # Example
+/// # Examples
 ///
 /// ```no_run
 /// use imping_hook::Hook;
@@ -63,140 +64,137 @@ pub struct Hook<F: Function = fn()> {
     target: usize,
 }
 
-/// The entry point for building a hook. Kept in its own non-generic `impl` so
-/// `Hook::at(..)` needs no turbofish; the real signature `F` is fixed later by
-/// [`HookBuilder::redirect`].
+// Non-generic so `Hook::at(..)` needs no turbofish; `redirect` fixes `F`.
 impl Hook {
-    /// Begins building a hook of the function at `target`.
+    /// Starts building a hook of the function at `target`.
     ///
-    /// `target` is the address of the function to hook, as resolved from a
-    /// module base. The hook is not created until [`install`](HookWith::install)
-    /// is called.
+    /// Nothing is patched until [`install`](HookWith::install).
     pub fn at(target: *const ()) -> HookBuilder {
         HookBuilder { target }
     }
 }
 
-// `Hook<F>` is automatically `Send + Sync`: `detour::TypedDetour` is both, and
-// the only other field is a plain address.
+// Send + Sync come for free: TypedDetour is both and the rest is an address.
 impl<F: Function> Hook<F> {
     /// Enables the hook, redirecting the target to the detour.
     ///
-    /// All other threads are suspended whilst the code is patched (see the
-    /// [type-level note](Self#thread-safety)). Enabling an already-enabled hook
-    /// does nothing. Inside a [`batch`](crate::batch) the change is queued and
-    /// applied when the batch ends.
+    /// Does nothing if already enabled. Suspends other threads while patching;
+    /// see [`Hook`] for threads and batches.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming the target if patching fails, such as
+    /// [`Error::TargetModified`] when a third party changed its code.
     pub fn enable(&self) -> Result<()> {
         self.toggle(true)
     }
 
     /// Disables the hook, restoring the original function.
     ///
-    /// All other threads are suspended whilst the code is restored (see the
-    /// [type-level note](Self#thread-safety)). Disabling an already-disabled
-    /// hook does nothing. Inside a [`batch`](crate::batch) the change is queued
-    /// and applied when the batch ends.
+    /// Does nothing if already disabled. Suspends other threads while patching;
+    /// see [`Hook`] for threads and batches.
+    ///
+    /// # Errors
+    ///
+    /// As for [`enable`](Self::enable).
     pub fn disable(&self) -> Result<()> {
         self.toggle(false)
     }
 
     /// Enables the hook without suspending other threads.
     ///
-    /// Faster than [`enable`](Self::enable), which has to find and suspend
-    /// every other thread, but nothing stops another thread from running the
-    /// target while it is patched. Takes effect at once, also inside a
-    /// [`batch`](crate::batch), replacing any change queued for this hook.
+    /// Faster than [`enable`](Self::enable), and applied at once even inside a
+    /// batch; see [`Hook`].
+    ///
+    /// # Errors
+    ///
+    /// As for [`enable`](Self::enable).
     ///
     /// # Safety
     ///
-    /// No other thread may execute the patched instructions (the first bytes of
-    /// the target) while they are written, or it may run a half-written
-    /// instruction.
+    /// No other thread may run the target's first bytes while they are
+    /// written, or it may execute a half-written instruction.
     pub unsafe fn enable_unsuspended(&self) -> Result<()> {
         crate::batch::forget(self.target);
         // SAFETY: forwarded from the caller.
         unsafe { self.toggle_now(true, detour::Threads::None) }
     }
 
-    /// Disables the hook without suspending other threads; see
-    /// [`enable_unsuspended`](Self::enable_unsuspended).
+    /// Disables the hook without suspending other threads.
+    ///
+    /// Applied at once like [`enable_unsuspended`](Self::enable_unsuspended).
+    ///
+    /// # Errors
+    ///
+    /// As for [`enable`](Self::enable).
     ///
     /// # Safety
     ///
-    /// No other thread may execute the patched instructions while the
-    /// original ones are written back.
+    /// No other thread may run the target's first bytes while the original
+    /// ones are written back.
     pub unsafe fn disable_unsuspended(&self) -> Result<()> {
         crate::batch::forget(self.target);
         // SAFETY: forwarded from the caller.
         unsafe { self.toggle_now(false, detour::Threads::None) }
     }
 
-    /// Returns whether the hook is currently enabled.
+    /// Returns whether the hook is enabled.
     pub fn is_enabled(&self) -> bool {
         self.inner.is_enabled()
     }
 
-    /// Returns the original, un-hooked function, borrowed from the hook.
+    /// Returns the original, unhooked function, borrowed from the hook.
     ///
-    /// It can be called regardless of whether the hook is enabled, through its
-    /// `call` method, which takes the same arguments as the function and is
-    /// `unsafe` if the function is. The borrow prevents it from outliving the
-    /// hook, so it can never call into released trampoline memory.
+    /// Callable whether or not the hook is enabled; see [`Original`](crate::Original).
     pub fn original(&self) -> F::Original<'_> {
         self.inner.original()
     }
 
-    /// Returns the trampoline — a pointer to the original function that is not
-    /// tied to the hook's lifetime.
+    /// Returns the original function as a pointer not tied to the hook's
+    /// lifetime.
     ///
-    /// Prefer [`original`](Self::original); use this only when the original must
-    /// be stored or passed somewhere that outlives a borrow.
+    /// Prefer [`original`](Self::original) unless the pointer has to outlive a
+    /// borrow.
     ///
     /// # Safety
     ///
-    /// The returned function must not be called after the hook is dropped. Use
-    /// [`leak`](Self::leak) if it must remain callable for the rest of the
-    /// process.
+    /// Don't call the returned function after the hook is dropped. Use
+    /// [`leak`](Self::leak) if it must stay callable.
     pub unsafe fn trampoline(&self) -> F {
-        // SAFETY: Forwarded from the caller.
+        // SAFETY: forwarded from the caller.
         unsafe { self.inner.trampoline() }
     }
 
-    /// Consumes the hook and keeps it installed for the rest of the process,
-    /// returning a `'static` callable to the original function.
+    /// Keeps the hook installed for the rest of the process and returns the
+    /// original function.
     ///
-    /// The hook is left in whatever state it is currently in, so call
-    /// [`enable`](Self::enable) first if it should stay active. The target's
-    /// address remains reserved, so it cannot be hooked again.
+    /// The hook stays in its current state, so enable it first if it should
+    /// stay active. The target address stays reserved.
     pub fn leak(self) -> F {
-        // SAFETY: `self` is immediately forgotten, so the detour is never
-        // dropped and its trampoline lives for the rest of the process. The
-        // returned function therefore remains valid for `'static`.
+        // SAFETY: `self` is forgotten right away, so the trampoline is never
+        // freed and stays valid for `'static`.
         let original = unsafe { self.inner.trampoline() };
         core::mem::forget(self);
         original
     }
 
-    /// Enables or disables the hook within a transaction that suspends all
-    /// other threads, or queues the change inside a `batch`.
+    /// Applies the change with every other thread suspended, or queues it
+    /// inside a batch.
     fn toggle(&self, enable: bool) -> Result<()> {
         if crate::batch::queue(&*self.inner, self.target, enable) {
             return Ok(());
         }
-        // SAFETY: `Threads::All` suspends every other thread of the process, so
-        // none can be executing the patched bytes whilst they are written, and
-        // any thread stopped inside them is relocated by the transaction. The
-        // only unsuspended thread is the caller, which must not be executing
-        // the target's prolog itself (documented on `enable`/`disable`).
+        // SAFETY: `Threads::All` suspends every other thread and moves any that
+        // stopped inside the patch; the caller isn't running the target's prolog.
         unsafe { self.toggle_now(enable, detour::Threads::All) }
     }
 
-    /// Enables or disables the patch now, in its own transaction.
+    /// Applies the change now, in its own transaction.
     ///
     /// # Safety
     ///
-    /// Threads not suspended by `threads` must not execute the patched bytes
-    /// while they are written.
+    /// Threads not suspended by `threads` must not run the patched bytes while
+    /// they are written.
     unsafe fn toggle_now(&self, enable: bool, threads: detour::Threads<'_>) -> Result<()> {
         let mut transaction = detour::Transaction::new();
         if enable {
@@ -212,13 +210,10 @@ impl<F: Function> Hook<F> {
 
 impl<F: Function> Drop for Hook<F> {
     fn drop(&mut self) {
-        // Disable through a transaction so no thread resumes mid-patch. Only
-        // release the address if the target was restored; if it could not be,
-        // its code is still patched (and `detour` leaks the generated code), so
-        // the address stays reserved.
+        // Release the address only once the target is restored. If it can't
+        // be, it's still patched (detour leaks its code) and stays reserved.
         crate::batch::forget(self.target);
-        // SAFETY: as in `toggle`; the caller must not be executing the target's
-        // prolog while dropping.
+        // SAFETY: as in `toggle`; the caller isn't running the target's prolog.
         if unsafe { self.toggle_now(false, detour::Threads::All) }.is_ok() {
             registry::release(self.target);
         }
@@ -241,8 +236,8 @@ pub struct HookBuilder {
 }
 
 impl HookBuilder {
-    /// Sets the `detour` the target will be redirected to, fixing the hook's
-    /// signature `F` to that of the detour.
+    /// Sets the detour to redirect the target to, which fixes the hook's
+    /// signature `F`.
     pub fn redirect<F: Function>(self, detour: F) -> HookWith<F> {
         HookWith {
             target: self.target,
@@ -252,8 +247,7 @@ impl HookBuilder {
 }
 
 /// A hook builder holding the target and detour, returned by
-/// [`HookBuilder::redirect`]. Call [`install`](Self::install) to create the
-/// hook.
+/// [`HookBuilder::redirect`].
 #[must_use = "a hook builder does nothing until `install` is called"]
 pub struct HookWith<F: Function> {
     target: *const (),
@@ -261,33 +255,33 @@ pub struct HookWith<F: Function> {
 }
 
 impl<F: Function> HookWith<F> {
-    /// Installs the hook, disabled. Enable it with [`Hook::enable`].
+    /// Installs the hook, disabled; enable it with [`Hook::enable`].
     ///
-    /// Fails with [`Error::AlreadyHooked`] if the target address is already
-    /// hooked by another detour or injection.
+    /// Only calls that reach the target are redirected; copies inlined into
+    /// callers are not.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::AlreadyHooked`] if a detour or injection already holds the
+    /// address; otherwise an error naming the target if it can't be patched.
     ///
     /// # Safety
     ///
-    /// - `target` must point to a function with the signature `F` (and not one
-    ///   that the compiler may have inlined into all of its callers).
-    /// - The detour must be compatible with that signature and calling
-    ///   convention.
-    ///
-    /// As with any inline hook, only calls that actually reach the target are
-    /// redirected; inlined calls are not.
+    /// - `target` must point to a function with signature `F`, not one the
+    ///   compiler may have inlined into all its callers.
+    /// - The detour must match that signature and calling convention.
     pub unsafe fn install(self) -> Result<Hook<F>> {
         let address = self.target as usize;
 
-        // Reserve the address first, so a second hook on it is refused.
+        // Claim the address up front so a second hook on it is refused.
         if !registry::claim(address) {
             return Err(Error::AlreadyHooked { address });
         }
 
-        // SAFETY: The caller guarantees `target` points to a function of
-        // signature `F`.
+        // SAFETY: the caller guarantees `target` is a function of signature `F`.
         let target_fn: F = unsafe { F::from_ptr(self.target) };
 
-        // SAFETY: The target and detour share the signature `F`, as required.
+        // SAFETY: the target and detour share the signature `F`.
         match unsafe { detour::TypedDetour::<F>::new(target_fn, self.detour) } {
             Ok(inner) => Ok(Hook {
                 inner: Box::new(inner),

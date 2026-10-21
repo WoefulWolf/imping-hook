@@ -1,9 +1,9 @@
-//! Code injection at an arbitrary address: either the caller's own machine
-//! code, or a register-context callback.
+//! Code injection at an arbitrary address: machine code, assembly, or a
+//! register-context callback.
 //!
-//! Both flavours run the injected work, then the instructions they displaced,
-//! then continue. They reuse [`detour::RawDetour`] for relocation and the
-//! trampoline, and write only the stub themselves.
+//! Each runs the injected work, then the displaced instructions, then carries
+//! on. [`detour::RawDetour`] does the relocation and trampoline; only the stub
+//! is written here.
 
 #[cfg(target_arch = "x86_64")]
 use crate::context::Context;
@@ -14,8 +14,7 @@ use core::mem::ManuallyDrop;
 use core::ptr;
 use region::Protection;
 
-/// The length of the absolute jump appended to a raw-bytes stub, per
-/// architecture.
+/// The length of the absolute jump that ends a raw-bytes stub.
 #[cfg(target_arch = "x86_64")]
 const ABS_JUMP_LEN: usize = 14;
 #[cfg(target_arch = "x86")]
@@ -26,8 +25,8 @@ compile_error!("imping-hook code injection supports only x86 and x86-64");
 
 /// Builds an absolute jump to `target` that clobbers no registers or flags.
 ///
-/// On x86-64 this is `jmp qword ptr [rip+0]` followed by the 64-bit address; on
-/// x86 it is `push imm32; ret`, which is stack- and flag-neutral.
+/// `jmp qword ptr [rip+0]` plus the address on x86-64; `push imm32; ret` on
+/// x86, which leaves the stack and flags as they were.
 fn absolute_jump(target: usize) -> [u8; ABS_JUMP_LEN] {
     let mut bytes = [0u8; ABS_JUMP_LEN];
     #[cfg(target_arch = "x86_64")]
@@ -45,13 +44,12 @@ fn absolute_jump(target: usize) -> [u8; ABS_JUMP_LEN] {
     bytes
 }
 
-/// A boxed register-context callback (always invoked with `&mut Context`; the
-/// read-only `inspect` wraps a `Fn(&Context)` into this shape).
+/// A register-context callback; `inspect` wraps its `Fn(&Context)` into this
+/// shape.
 #[cfg(target_arch = "x86_64")]
 type ContextFn = dyn Fn(&mut Context) + Send + Sync;
 
-/// A boxed assembly builder (see [`InjectionBuilder::asm`]), run once at install
-/// to author the injected code.
+/// An [`InjectionBuilder::asm`] closure, run once at install.
 #[cfg(target_arch = "x86_64")]
 type BoxedAsm = Box<
     dyn FnOnce(
@@ -59,31 +57,35 @@ type BoxedAsm = Box<
     ) -> core::result::Result<(), iced_x86::IcedError>,
 >;
 
-/// A generous upper bound on the assembled size of a register-context stub.
-/// The real stub is a few hundred bytes; the allocation is page-rounded anyway.
+/// A generous upper bound on the size of a register-context stub.
+///
+/// The real stub is a few hundred bytes, and the allocation is page-rounded
+/// anyway.
 #[cfg(target_arch = "x86_64")]
 const CONTEXT_STUB_CAPACITY: usize = 1024;
 
-/// The Rust side of a register-context injection: invokes the callback with the
-/// saved context. Reached from the stub with the Win64 argument registers set.
+/// Calls a register-context callback with the saved context.
+///
+/// The stub calls this with the Win64 argument registers set.
 ///
 /// # Safety
 ///
-/// `ctx` must point to a valid, writable [`Context`]; `closure` must be the
-/// pointer installed for this injection, valid for the call.
+/// `ctx` must point to a valid, writable [`Context`], and `closure` to this
+/// injection's callback, both valid for the call.
 #[cfg(target_arch = "x86_64")]
 unsafe extern "C" fn context_trampoline(ctx: *mut Context, closure: *mut Box<ContextFn>) {
-    // SAFETY: both pointers are set up by the stub and valid for this call.
+    // SAFETY: the stub passes both pointers, valid for this call.
     let (closure, ctx): (&ContextFn, &mut Context) = unsafe { (&**closure, &mut *ctx) };
-    // A panic must not unwind into the patched function (non-Rust frames), so
-    // catch it and continue with the context as the closure left it.
+    // Never unwind into the patched (non-Rust) frames; carry on with the
+    // context as the closure left it.
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| closure(ctx)));
 }
 
-/// Assembles the register-context stub: save the full context on the stack,
-/// call [`context_trampoline`] with it and `closure_ptr`, restore the (possibly
-/// modified) context, then jump to the trampoline — or, if the callback changed
-/// `rip`, to the new address with the chosen `rsp`.
+/// Assembles the register-context stub.
+///
+/// It saves the full context on the stack, calls [`context_trampoline`],
+/// restores the (maybe changed) context, then jumps to the trampoline, or to a
+/// changed `rip` with the chosen `rsp`.
 #[cfg(target_arch = "x86_64")]
 fn assemble_context_stub(
     hook_addr: u64,
@@ -206,24 +208,21 @@ fn assemble_context_stub(
     a.assemble(0)
 }
 
-/// An injection, and the RAII guard that owns it.
+/// A code injection, and the RAII guard that owns it.
 ///
-/// Reaching `target` runs the injected work — raw machine code
-/// ([`code`](InjectionBuilder::code)) or a register-context callback
-/// ([`inspect`](InjectionBuilder::inspect) / [`modify`](InjectionBuilder::modify))
-/// — then the displaced original instructions, then continues. Build one with
-/// [`Injection::at`].
+/// Reaching the target runs the injected work, then the displaced original
+/// instructions, then the rest of the original code. The work is machine code
+/// ([`code`](InjectionBuilder::code), [`asm`](InjectionBuilder::asm)) or a
+/// register-context callback ([`inspect`](InjectionBuilder::inspect),
+/// [`modify`](InjectionBuilder::modify)). Build one with [`Injection::at`].
 ///
-/// # Thread safety and dropping
+/// # Threads, batches and dropping
 ///
-/// Enabling, disabling, and dropping an `Injection` suspend every other thread
-/// whilst the code is patched, exactly like [`Hook`](crate::Hook). A
-/// register-context callback may run on several threads at once, each with its
-/// own [`Context`](crate::Context); use interior mutability for any state the
-/// callback keeps of its own. On drop the patch is reverted and the stub (and
-/// any callback) freed; if it cannot be reverted, they are leaked so the target
-/// never jumps into freed memory. [`leak`](Self::leak) keeps an injection
-/// installed for the rest of the process.
+/// These work as for [`Hook`](crate::Hook): patching suspends other threads,
+/// [`batch`](crate::batch) queues changes, and dropping reverts the patch and
+/// frees the stub and callback, or leaks them if the patch can't be reverted.
+/// A callback may run on several threads at once, each with its own
+/// [`Context`](crate::Context), so keep its own state in atomics or locks.
 pub struct Injection {
     // Boxed so its address stays put while a `batch` has a change queued.
     inner: Box<detour::RawDetour>,
@@ -234,110 +233,112 @@ pub struct Injection {
     target: usize,
 }
 
-// `Injection` is `Send + Sync`: `detour::RawDetour` is both, the allocation is
-// owned memory, the callback is `Send + Sync`, and the rest is a plain address.
-// SAFETY: the stub is only mutated during construction (before it is shared)
-// and freed during drop; all code modification is serialized by the backend's
-// global patch lock.
+// SAFETY: RawDetour and the callback are Send + Sync, the stub is only written
+// before it's shared, and all patching goes through the global patch lock.
 unsafe impl Send for Injection {}
-// SAFETY: see above; `&Injection` only exposes locked operations and atomics.
+// SAFETY: `&Injection` only exposes locked operations and atomics.
 unsafe impl Sync for Injection {}
 
 impl Injection {
-    /// Begins building an injection at `target`.
+    /// Starts building an injection at `target`.
     ///
-    /// `target` is the address at which the injected work will run, as resolved
-    /// from a module base. Nothing is patched until
-    /// [`install`](InjectionWith::install) is called.
+    /// Nothing is patched until [`install`](InjectionWith::install).
     pub fn at(target: *const ()) -> InjectionBuilder {
         InjectionBuilder { target }
     }
 
     /// Enables the injection.
     ///
-    /// All other threads are suspended whilst the code is patched (see the
-    /// [type-level note](Self#thread-safety-and-dropping)). Enabling an
-    /// already-enabled injection does nothing. Inside a [`batch`](crate::batch)
-    /// the change is queued and applied when the batch ends.
+    /// Does nothing if already enabled. Suspends other threads while patching;
+    /// see [`Injection`] for threads and batches.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming the target if patching fails, such as
+    /// [`Error::TargetModified`] when a third party changed its code.
     pub fn enable(&self) -> Result<()> {
         self.toggle(true)
     }
 
     /// Disables the injection, restoring the original code.
     ///
-    /// All other threads are suspended whilst the code is restored. Disabling
-    /// an already-disabled injection does nothing. Inside a [`batch`](crate::batch)
-    /// the change is queued and applied when the batch ends.
+    /// Does nothing if already disabled. Suspends other threads while patching;
+    /// see [`Injection`] for threads and batches.
+    ///
+    /// # Errors
+    ///
+    /// As for [`enable`](Self::enable).
     pub fn disable(&self) -> Result<()> {
         self.toggle(false)
     }
 
     /// Enables the injection without suspending other threads.
     ///
-    /// Faster than [`enable`](Self::enable), which has to find and suspend
-    /// every other thread, but nothing stops another thread from running the
-    /// target while it is patched. Takes effect at once, also inside a
-    /// [`batch`](crate::batch), replacing any change queued for this injection.
+    /// Faster than [`enable`](Self::enable), and applied at once even inside a
+    /// batch; see [`Hook`](crate::Hook#batches).
+    ///
+    /// # Errors
+    ///
+    /// As for [`enable`](Self::enable).
     ///
     /// # Safety
     ///
-    /// No other thread may execute the patched instructions (the first bytes of
-    /// the target) while they are written, or it may run a half-written
-    /// instruction.
+    /// No other thread may run the target's first bytes while they are
+    /// written, or it may execute a half-written instruction.
     pub unsafe fn enable_unsuspended(&self) -> Result<()> {
         crate::batch::forget(self.target);
         // SAFETY: forwarded from the caller.
         unsafe { self.toggle_now(true, detour::Threads::None) }
     }
 
-    /// Disables the injection without suspending other threads; see
-    /// [`enable_unsuspended`](Self::enable_unsuspended).
+    /// Disables the injection without suspending other threads.
+    ///
+    /// Applied at once like [`enable_unsuspended`](Self::enable_unsuspended).
+    ///
+    /// # Errors
+    ///
+    /// As for [`enable`](Self::enable).
     ///
     /// # Safety
     ///
-    /// No other thread may execute the patched instructions while the
-    /// original ones are written back.
+    /// No other thread may run the target's first bytes while the original
+    /// ones are written back.
     pub unsafe fn disable_unsuspended(&self) -> Result<()> {
         crate::batch::forget(self.target);
         // SAFETY: forwarded from the caller.
         unsafe { self.toggle_now(false, detour::Threads::None) }
     }
 
-    /// Returns whether the injection is currently enabled.
+    /// Returns whether the injection is enabled.
     pub fn is_enabled(&self) -> bool {
         self.inner.is_enabled()
     }
 
-    /// Consumes the injection and keeps it installed for the rest of the
-    /// process.
+    /// Keeps the injection installed for the rest of the process.
     ///
-    /// The injection is left in whatever state it is currently in, so call
-    /// [`enable`](Self::enable) first if it should stay active. The target's
-    /// address remains reserved, so it cannot be hooked again.
+    /// It stays in its current state, so enable it first if it should stay
+    /// active. The target address stays reserved.
     pub fn leak(self) {
         core::mem::forget(self);
     }
 
-    /// Enables or disables the injection within a transaction that suspends all
-    /// other threads, or queues the change inside a `batch`.
+    /// Applies the change with every other thread suspended, or queues it
+    /// inside a batch.
     fn toggle(&self, enable: bool) -> Result<()> {
         if crate::batch::queue(&*self.inner, self.target, enable) {
             return Ok(());
         }
-        // SAFETY: `Threads::All` suspends every other thread of the process, so
-        // none can be executing the patched bytes whilst they are written, and
-        // any thread stopped inside them is relocated by the transaction. The
-        // only unsuspended thread is the caller, which must not be executing
-        // the patched bytes itself.
+        // SAFETY: `Threads::All` suspends every other thread and moves any that
+        // stopped inside the patch; the caller isn't running the patched bytes.
         unsafe { self.toggle_now(enable, detour::Threads::All) }
     }
 
-    /// Enables or disables the patch now, in its own transaction.
+    /// Applies the change now, in its own transaction.
     ///
     /// # Safety
     ///
-    /// Threads not suspended by `threads` must not execute the patched bytes
-    /// while they are written.
+    /// Threads not suspended by `threads` must not run the patched bytes while
+    /// they are written.
     unsafe fn toggle_now(&self, enable: bool, threads: detour::Threads<'_>) -> Result<()> {
         let mut transaction = detour::Transaction::new();
         if enable {
@@ -350,14 +351,15 @@ impl Injection {
             .map_err(|error| Error::from_detour(error, self.target))
     }
 
-    /// Allocates the stub, creates the disabled detour, and writes the stub
-    /// `render`ed from the trampoline address. Reserving the target address and
-    /// releasing it on failure is the caller's responsibility.
+    /// Allocates the stub, creates the disabled detour, and writes the bytes
+    /// `render` builds from the stub and trampoline addresses.
+    ///
+    /// The caller claims the target address and releases it on failure.
     ///
     /// # Safety
     ///
-    /// See [`InjectionWith::install`]. `closure` must be null, or a
-    /// `*mut Box<ContextFn>` this injection should free on drop.
+    /// As for [`InjectionWith::install`]. `closure` must be null, or a
+    /// `*mut Box<ContextFn>` the injection frees on drop.
     unsafe fn install_stub(
         target: *const (),
         capacity: usize,
@@ -378,10 +380,8 @@ impl Injection {
             |error| Error::Os(OsError::from_region(error, "protecting the injection stub")),
         )?;
 
-        // Create the disabled detour: reaching `target` jumps to the stub. The
-        // backend relocates the displaced instructions into a trampoline.
-        // SAFETY: forwarded — `target` is executable code the caller vouches
-        // for; the stub is executable and distinct from the target.
+        // SAFETY: the caller vouches for `target`; the stub is executable and
+        // distinct from it.
         let inner = unsafe { detour::RawDetour::new(target, stub_ptr.cast()) }
             .map_err(|error| Error::from_detour(error, address))?;
         let trampoline = inner.trampoline() as usize;
@@ -392,14 +392,14 @@ impl Injection {
             "imping-hook: injection stub exceeded its allocation"
         );
 
-        // SAFETY: reverting to read-write the allocation we own.
+        // SAFETY: we own this allocation.
         unsafe { region::protect(stub_ptr, stub_size, Protection::READ_WRITE) }.map_err(
             |error| Error::Os(OsError::from_region(error, "protecting the injection stub")),
         )?;
-        // SAFETY: `stub_ptr` owns `stub_size >= bytes.len()` writable bytes, and
-        // the source is disjoint from it.
+        // SAFETY: the stub has `stub_size >= bytes.len()` writable bytes and
+        // doesn't overlap `bytes`.
         unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), stub_ptr, bytes.len()) };
-        // SAFETY: restoring execute protection on the allocation we own.
+        // SAFETY: we own this allocation.
         unsafe { region::protect(stub_ptr, stub_size, Protection::READ_EXECUTE) }.map_err(
             |error| Error::Os(OsError::from_region(error, "protecting the injection stub")),
         )?;
@@ -419,7 +419,7 @@ impl Injection {
     ///
     /// # Safety
     ///
-    /// See [`InjectionWith::install`].
+    /// As for [`InjectionWith::install`].
     unsafe fn build_bytes(target: *const (), code: Vec<u8>) -> Result<Injection> {
         let capacity = code.len() + ABS_JUMP_LEN;
         // SAFETY: forwarded from the caller.
@@ -441,14 +441,14 @@ impl Injection {
     ///
     /// # Safety
     ///
-    /// See [`InjectionWith::install`].
+    /// As for [`InjectionWith::install`].
     #[cfg(target_arch = "x86_64")]
     unsafe fn build_context(target: *const (), closure: Box<ContextFn>) -> Result<Injection> {
         let hook_addr = target as usize as u64;
         let rust_trampoline = context_trampoline
             as unsafe extern "C" fn(*mut Context, *mut Box<ContextFn>)
             as usize as u64;
-        // Leak the callback to a stable thin pointer the stub can reference.
+        // A thin, stable pointer for the stub to embed; freed on drop.
         let closure_ptr: *mut Box<ContextFn> = Box::into_raw(Box::new(closure));
 
         // SAFETY: forwarded from the caller.
@@ -469,21 +469,21 @@ impl Injection {
             )
         };
         if result.is_err() {
-            // SAFETY: `closure_ptr` came from `Box::into_raw` above and the stub
-            // referencing it was never installed.
+            // SAFETY: `closure_ptr` came from `Box::into_raw` above, and no stub
+            // using it was installed.
             drop(unsafe { Box::from_raw(closure_ptr) });
         }
         result
     }
 
-    /// Builds an injection from assembly authored with iced's `code_asm`.
+    /// Builds an injection from assembly written with iced's `code_asm`.
     ///
-    /// The user block is assembled at the real stub address (so rip-relative
-    /// operands resolve correctly), followed by a jump to the trampoline.
+    /// The block is assembled at the real stub address, so rip-relative
+    /// operands resolve, and followed by a jump to the trampoline.
     ///
     /// # Safety
     ///
-    /// See [`InjectionWith::install`].
+    /// As for [`InjectionWith::install`].
     #[cfg(target_arch = "x86_64")]
     unsafe fn build_asm(target: *const (), build: BoxedAsm) -> Result<Injection> {
         use iced_x86::code_asm::CodeAssembler;
@@ -494,16 +494,15 @@ impl Injection {
             reason: error.to_string(),
         })?;
         if let Err(error) = build(&mut assembler) {
-            // The failing instruction was not added, so the number already added
-            // is its zero-based position.
+            // The failing instruction isn't added, so the count is its index.
             let index = assembler.instructions().len();
             return Err(Error::Assembly {
                 address,
                 reason: format!("instruction {index}: {error}"),
             });
         }
-        // Encode once at a dummy address to size the allocation; the length is
-        // independent of the address (only relative/rip-relative values change).
+        // Encode at a dummy address just to size the stub; the address changes
+        // relative operands, not the length.
         let capacity = assembler
             .assemble(0)
             .map_err(|error| Error::Assembly {
@@ -520,8 +519,7 @@ impl Injection {
                 capacity,
                 ptr::null_mut(),
                 move |stub, trampoline| {
-                    // Re-encoding at a different address cannot fail once the first
-                    // encode succeeded, so the expect is an internal invariant.
+                    // Can't fail once the sizing encode above succeeded.
                     let mut bytes = assembler
                         .assemble(stub as u64)
                         .expect("imping-hook: internal error reassembling injected asm");
@@ -535,13 +533,11 @@ impl Injection {
 
 impl Drop for Injection {
     fn drop(&mut self) {
-        // Revert the patch through a transaction so no thread resumes mid-patch.
-        // Only free the stub (and callback) if the target was restored;
-        // otherwise it may still jump to the stub, so they are leaked and the
-        // address stays reserved (the backend likewise leaks its own code).
+        // Free the stub and callback only once the target is restored. If it
+        // can't be, the target may still jump there, so they leak (as does
+        // detour's own code) and the address stays reserved.
         crate::batch::forget(self.target);
-        // SAFETY: as in `toggle`; the caller must not be executing the patched
-        // bytes while dropping.
+        // SAFETY: as in `toggle`; the caller isn't running the patched bytes.
         if unsafe { self.toggle_now(false, detour::Threads::All) }.is_ok() {
             registry::release(self.target);
             // SAFETY: the target no longer jumps to the stub, and neither the
@@ -549,8 +545,8 @@ impl Drop for Injection {
             unsafe { ManuallyDrop::drop(&mut self.stub) };
             #[cfg(target_arch = "x86_64")]
             if !self.closure.is_null() {
-                // SAFETY: `closure` is the `Box<ContextFn>` leaked for this
-                // injection (null otherwise, excluded above).
+                // SAFETY: a non-null `closure` is this injection's boxed
+                // callback from `Box::into_raw`.
                 drop(unsafe { Box::from_raw(self.closure as *mut Box<ContextFn>) });
             }
         }
@@ -566,7 +562,7 @@ impl core::fmt::Debug for Injection {
     }
 }
 
-/// The payload of an [`InjectionWith`]: raw bytes, an assembly builder, or a
+/// What an [`InjectionWith`] injects: raw bytes, an assembly builder, or a
 /// register-context callback.
 enum Payload {
     Bytes(Vec<u8>),
@@ -586,9 +582,8 @@ pub struct InjectionBuilder {
 impl InjectionBuilder {
     /// Injects the caller's own machine code at the target.
     ///
-    /// The bytes are copied into the stub, so the slice need not outlive this
-    /// call. The code must honour the platform ABI itself (see
-    /// [`install`](InjectionWith::install)).
+    /// The bytes are copied, so the slice needn't outlive this call. The code
+    /// must follow the ABI rules of [`install`](InjectionWith::install).
     pub fn code(self, code: &[u8]) -> InjectionWith {
         InjectionWith {
             target: self.target,
@@ -596,17 +591,13 @@ impl InjectionBuilder {
         }
     }
 
-    /// Injects machine code authored as assembly.
+    /// Injects machine code written as assembly.
     ///
-    /// `build` receives an [`asm::CodeAssembler`](crate::asm::CodeAssembler) to
-    /// append instructions to; reference Rust values by passing them as operands
-    /// (e.g. `a.mov(rax, some_addr)`). The block is assembled at install time at
-    /// the real stub address, so rip-relative operands resolve correctly, and a
-    /// jump back to the original code is appended automatically.
-    ///
-    /// The same ABI obligations as [`code`](Self::code) apply: preserve the
-    /// registers and flags the surrounding function relies on, keep the stack
-    /// balanced, and do not branch into the displaced bytes.
+    /// `build` appends to an [`asm::CodeAssembler`](crate::asm::CodeAssembler);
+    /// pass Rust values as operands, e.g. `a.mov(rax, some_addr)`. It's
+    /// assembled at the stub's real address, so rip-relative operands resolve,
+    /// and the jump back is appended. The ABI rules of
+    /// [`install`](InjectionWith::install) apply.
     #[cfg(target_arch = "x86_64")]
     pub fn asm<F>(self, build: F) -> InjectionWith
     where
@@ -621,13 +612,11 @@ impl InjectionBuilder {
         }
     }
 
-    /// Injects a read-only register-context callback.
+    /// Injects a callback that reads the registers at the target.
     ///
-    /// When the target is reached, `callback` is invoked with a shared
-    /// [`Context`](crate::Context) of the saved registers; the original code
-    /// then resumes unchanged. The callback may run on several threads at once,
-    /// so it must be `Send + Sync` and use interior mutability for its own
-    /// state.
+    /// `callback` gets the saved [`Context`](crate::Context), then the original
+    /// code resumes unchanged. It may run on several threads at once; see
+    /// [`Injection`].
     #[cfg(target_arch = "x86_64")]
     pub fn inspect<F>(self, callback: F) -> InjectionWith
     where
@@ -639,12 +628,11 @@ impl InjectionBuilder {
         }
     }
 
-    /// Injects a mutable register-context callback.
+    /// Injects a callback that can change the registers at the target.
     ///
-    /// Like [`inspect`](Self::inspect), but the callback receives a mutable
-    /// [`Context`](crate::Context): writing a register changes it before the
-    /// original code resumes. Changing `rip` redirects execution (skipping the
-    /// displaced originals) to the new address with the chosen `rsp`.
+    /// Like [`inspect`](Self::inspect), but register writes take effect before
+    /// the original code resumes. Changing [`rip`](crate::Context::rip) jumps
+    /// there instead, skipping the displaced instructions.
     #[cfg(target_arch = "x86_64")]
     pub fn modify<F>(self, callback: F) -> InjectionWith
     where
@@ -657,10 +645,8 @@ impl InjectionBuilder {
     }
 }
 
-/// An injection builder holding the target and its payload, returned by
-/// [`InjectionBuilder::code`], [`inspect`](InjectionBuilder::inspect) or
-/// [`modify`](InjectionBuilder::modify). Call [`install`](Self::install) to
-/// patch the target.
+/// An injection builder holding the target and what to inject, returned by the
+/// [`InjectionBuilder`] methods.
 #[must_use = "an injection builder does nothing until `install` is called"]
 pub struct InjectionWith {
     target: *const (),
@@ -668,26 +654,29 @@ pub struct InjectionWith {
 }
 
 impl InjectionWith {
-    /// Installs the injection, disabled. Enable it with [`Injection::enable`].
+    /// Installs the injection, disabled; enable it with [`Injection::enable`].
     ///
-    /// Fails with [`Error::AlreadyHooked`] if the target address is already
-    /// hooked by another injection or detour.
+    /// # Errors
+    ///
+    /// [`Error::AlreadyHooked`] if a detour or injection already holds the
+    /// address, [`Error::Assembly`] if [`asm`](InjectionBuilder::asm) code
+    /// can't be encoded, otherwise an error naming the target if it can't be
+    /// patched.
     ///
     /// # Safety
     ///
     /// - `target` must point to executable code whose first bytes can be
-    ///   relocated (as for any inline patch), and which it is valid to resume
-    ///   after the injected work runs.
-    /// - For [`code`](InjectionBuilder::code) and
-    ///   [`asm`](InjectionBuilder::asm): the injected code must honour the
-    ///   platform ABI — preserve every register and flag the surrounding
-    ///   function relies on, keep the stack balanced and aligned (reserving
-    ///   shadow space before any `call` on Windows x64), and not branch into the
-    ///   displaced bytes. (The register-context callbacks handle this for you.)
+    ///   relocated, and which can be resumed after the injected work.
+    /// - Code from [`code`](InjectionBuilder::code) or
+    ///   [`asm`](InjectionBuilder::asm) must follow the platform ABI: preserve
+    ///   every register and flag the surrounding code relies on, keep the stack
+    ///   balanced and aligned (with shadow space before any `call` on Windows
+    ///   x64), and not branch into the displaced bytes. Register-context
+    ///   callbacks handle this themselves.
     pub unsafe fn install(self) -> Result<Injection> {
         let address = self.target as usize;
 
-        // Reserve the address first, so a second hook on it is refused.
+        // Claim the address up front so a second hook on it is refused.
         if !registry::claim(address) {
             return Err(Error::AlreadyHooked { address });
         }

@@ -1,18 +1,11 @@
 //! In-process function hooking for the imping modding suite.
 //!
-//! This crate installs hooks in the running process: typed function detours
-//! ([`Hook`]) and raw code injection at arbitrary addresses ([`Injection`]). It
-//! depends on nothing else in the suite and can be used on its own.
+//! Installs typed function detours and code injections at arbitrary addresses
+//! in the running process, and depends on nothing else in the suite.
+//! Relocation, near-memory allocation and thread-safe patching come from the
+//! [`detour`] crate, wrapped behind this crate's types.
 //!
-//! The hard parts — decoding and relocating the displaced instructions,
-//! allocating executable memory within reach of the target, and patching code
-//! whilst other threads are suspended — are provided by the [`detour`] crate,
-//! wrapped behind this crate's own types so the backend can be replaced later.
-//!
-//! # Typed detours
-//!
-//! A [`Hook`] redirects a function to another of the same signature, whilst
-//! keeping the original callable:
+//! # Examples
 //!
 //! ```no_run
 //! use imping_hook::Hook;
@@ -37,9 +30,15 @@
 //! # }
 //! ```
 //!
-//! Enabling, disabling, and dropping a hook suspend all other threads whilst
-//! the code is patched, so hooks are safe to toggle in a running, multi-threaded
-//! process.
+//! # Main items
+//!
+//! - [`Hook`] redirects a function to another of the same signature and keeps
+//!   the original callable. Its docs cover threads, batches and dropping.
+//! - [`Injection`] runs machine code, assembly or a register callback at an
+//!   address, then the original code.
+//! - [`batch`] applies many enables and disables with one thread suspension.
+//! - [`Context`] holds the registers a register callback sees.
+//! - [`Error`] lists everything that can fail.
 
 #![warn(missing_docs)]
 
@@ -59,13 +58,12 @@ pub use crate::function::{Function, Original};
 pub use crate::hook::{Hook, HookBuilder, HookWith};
 pub use crate::inject::{Injection, InjectionBuilder, InjectionWith};
 
-/// The assembler used to author injected code with
+/// Re-exports the assembler used by
 /// [`InjectionBuilder::asm`](crate::InjectionBuilder::asm).
 ///
-/// This re-exports [`iced_x86`]'s `code_asm` module — [`CodeAssembler`], the
-/// register constants (`rax`, `xmm0`, …), the memory-operand helpers
-/// (`qword_ptr`, …) — plus [`IcedError`]. Reference Rust values by passing them
-/// as operands, e.g. `a.mov(rax, some_addr)`.
+/// This is [`iced_x86`]'s `code_asm` module ([`CodeAssembler`], register
+/// constants such as `rax` and `xmm0`, operand helpers such as `qword_ptr`)
+/// plus [`IcedError`].
 ///
 /// [`CodeAssembler`]: iced_x86::code_asm::CodeAssembler
 /// [`IcedError`]: iced_x86::IcedError

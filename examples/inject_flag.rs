@@ -15,16 +15,15 @@ fn main() -> imping_hook::Result<()> {
         std::hint::black_box(x) + 1
     }
 
-    // Machine code (x86-64) that sets FLAG to 1 without disturbing the original
-    // function: save rax, store 1 to FLAG's address, restore rax. `mov` and
-    // push/pop leave the flags untouched, and no argument register is touched.
+    // Sets FLAG without disturbing the function: push, mov and pop leave the
+    // flags alone, and rax is restored.
     let flag_addr = &FLAG as *const AtomicU8 as u64;
     let mut code = vec![0x50, 0x48, 0xB8]; // push rax; mov rax, imm64
     code.extend_from_slice(&flag_addr.to_le_bytes());
     code.extend_from_slice(&[0xC6, 0x00, 0x01, 0x58]); // mov byte [rax], 1; pop rax
 
     // SAFETY: `target` is a real function whose entry can be relocated, and the
-    // injected code preserves every register and flag the function relies on.
+    // code preserves every register and flag it relies on.
     let injection = unsafe { Injection::at(target as *const ()).code(&code).install()? };
 
     println!(

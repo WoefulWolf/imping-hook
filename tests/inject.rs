@@ -1,7 +1,5 @@
-//! Integration tests for raw code injection.
-//!
-//! The injected machine code is x86-64, so these tests run on that
-//! architecture only.
+//! Integration tests for raw code injection (x86-64 only, like the injected
+//! code).
 #![cfg(target_arch = "x86_64")]
 
 use imping_hook::{Error, Hook, Injection};
@@ -38,18 +36,15 @@ fn injected_code_runs_then_original_continues() {
             .expect("install")
     };
 
-    // Before enabling, the injection has no effect.
     FLAG.store(0, Ordering::SeqCst);
     assert_eq!(basic_target(10), 11);
     assert_eq!(FLAG.load(Ordering::SeqCst), 0);
 
-    // While enabled, the injected code runs and the original still returns.
     injection.enable().expect("enable");
     FLAG.store(0, Ordering::SeqCst);
     assert_eq!(basic_target(10), 11);
     assert_eq!(FLAG.load(Ordering::SeqCst), 1);
 
-    // After disabling, the effect is gone again.
     injection.disable().expect("disable");
     FLAG.store(0, Ordering::SeqCst);
     assert_eq!(basic_target(10), 11);
@@ -78,7 +73,6 @@ fn drop_reverts_injection() {
         assert_eq!(drop_target(10), 11);
         assert_eq!(FLAG.load(Ordering::SeqCst), 1);
     }
-    // The guard is dropped; the patch is reverted.
     FLAG.store(0, Ordering::SeqCst);
     assert_eq!(drop_target(10), 11);
     assert_eq!(FLAG.load(Ordering::SeqCst), 0);
@@ -102,7 +96,6 @@ fn injection_and_detour_share_the_address_registry() {
             .expect("install")
     };
 
-    // A detour on the same address is refused while the injection holds it.
     extern "C" fn replacement(_: i32) -> i32 {
         0
     }
@@ -116,7 +109,6 @@ fn injection_and_detour_share_the_address_registry() {
 
     drop(injection);
 
-    // Once the injection is gone, the address is free again.
     // SAFETY: real function, shared signature.
     let detour = unsafe {
         Hook::at(shared_target as *const ())
@@ -146,9 +138,8 @@ fn multithreaded_enable_disable() {
 
     let stop = Arc::new(AtomicBool::new(false));
 
-    // Workers call the target while the main thread toggles the injection.
-    // Every call must return the original result and never crash, whether or
-    // not the injection is enabled at that instant.
+    // Workers call the target while this thread toggles the injection; every
+    // call must return the original result either way.
     let workers: Vec<_> = (0..4)
         .map(|_| {
             let stop = Arc::clone(&stop);

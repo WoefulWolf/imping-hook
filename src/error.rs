@@ -5,27 +5,27 @@ use core::fmt;
 /// The result of a hooking operation.
 pub type Result<T> = core::result::Result<T, Error>;
 
-/// Everything that can go wrong when installing, enabling, or disabling a hook.
+/// Everything that can go wrong when installing, enabling or disabling a hook.
 ///
-/// Every variant that refers to a specific location carries its `address`, so
-/// the [`Display`](fmt::Display) message can name it.
+/// Variants about a specific location carry its `address`, which the
+/// [`Display`](fmt::Display) message names.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Error {
-    /// A hook (detour or injection) is already installed at this address, and
-    /// chaining is not supported.
+    /// A detour or injection is already installed at this address; hooks
+    /// aren't chained.
     AlreadyHooked {
         /// The address that is already hooked.
         address: usize,
     },
-    /// The target is too small to be patched, and has no usable padding or
-    /// hot-patch area.
+    /// The target is too small to patch and has no usable padding or hot-patch
+    /// area.
     NotEnoughSpace {
         /// The address that could not be patched.
         address: usize,
     },
-    /// The bytes that would be displaced contain an instruction that cannot be
-    /// relocated to the trampoline (e.g. a relative branch out of range).
+    /// A displaced instruction can't be relocated to the trampoline, such as a
+    /// relative branch that would be out of range.
     UnrelocatableInstruction {
         /// The address of the offending instruction.
         address: usize,
@@ -51,25 +51,25 @@ pub enum Error {
         /// The shared address.
         address: usize,
     },
-    /// The code at the address was modified by a third party since the hook was
-    /// installed, so it can no longer be toggled safely.
+    /// A third party changed the code at the address since the hook was
+    /// installed, so it can't be toggled safely.
     TargetModified {
         /// The address whose code was modified.
         address: usize,
     },
-    /// A thread suspended during a transaction is executing code that cannot be
+    /// A thread suspended for patching is running code that can't be
     /// relocated.
     ThreadNotRelocatable,
     /// The assembly supplied to an injection could not be encoded.
     Assembly {
         /// The address the injection was being built for.
         address: usize,
-        /// The assembler's description of the failure (for an invalid
-        /// instruction, prefixed with its position in the sequence).
+        /// The assembler's message, prefixed with the instruction's position
+        /// when one instruction is invalid.
         reason: String,
     },
-    /// An operating system call (memory protection, or thread suspension)
-    /// failed.
+    /// An operating system call failed, such as changing memory protection or
+    /// suspending a thread.
     Os(OsError),
 }
 
@@ -127,8 +127,7 @@ impl core::error::Error for Error {
 }
 
 impl Error {
-    /// Maps a [`detour::Error`] to our error, attaching the `address` the
-    /// operation concerned (`detour`'s errors do not carry it).
+    /// Maps a [`detour::Error`] to ours, adding the `address` it lacks.
     pub(crate) fn from_detour(error: detour::Error, address: usize) -> Self {
         match error {
             detour::Error::SameAddress => Error::SameAddress { address },
@@ -141,22 +140,19 @@ impl Error {
             detour::Error::ThreadNotRelocatable => Error::ThreadNotRelocatable,
             detour::Error::Memory(os) => Error::Os(OsError::from_detour(os, "memory protection")),
             detour::Error::Thread(os) => Error::Os(OsError::from_detour(os, "thread suspension")),
-            // The remaining variants cannot occur with the exact `detour`
-            // version this crate pins: hooks are always initialized at
-            // construction (ruling out `NotInitialized` / `AlreadyInitialized`),
-            // and on Windows thread suspension is always available (ruling out
-            // `ThreadsUnsupported`). The wildcard is required because
-            // `detour::Error` is `#[non_exhaustive]`.
+            // Can't occur with the pinned detour version: hooks are initialized
+            // at construction, and Windows always has thread suspension. The
+            // wildcard is needed because `detour::Error` is non-exhaustive.
             other => unreachable!("detour returned an error that cannot occur here: {other:?}"),
         }
     }
 }
 
-/// A failed operating system call (e.g. allocating or protecting memory, or
-/// suspending a thread).
+/// A failed operating system call, such as allocating or protecting memory or
+/// suspending a thread.
 ///
-/// It carries a short description of the operation, and the raw OS error code
-/// when one is available.
+/// Carries a short description of the operation and, when available, the raw
+/// OS error code.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OsError {
     /// The operating system error code (`GetLastError` on Windows), if known.
@@ -189,12 +185,10 @@ impl OsError {
         OsError { code, context }
     }
 
-    /// Builds an error from the calling thread's last OS error
-    /// (`GetLastError`).
+    /// Builds an error from the calling thread's `GetLastError` code.
     #[cfg(windows)]
     pub(crate) fn last_os_error(context: &'static str) -> Self {
-        // SAFETY: `GetLastError` only reads the calling thread's last-error
-        // code and has no preconditions.
+        // SAFETY: `GetLastError` has no preconditions.
         let code = unsafe { windows_sys::Win32::Foundation::GetLastError() };
         OsError {
             code: Some(code as i32),
