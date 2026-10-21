@@ -4,6 +4,8 @@ In-process function hooking for the imping modding suite. It depends on nothing 
 
 Status: early development, not published. Windows x64 only for now.
 
+API docs: https://woefulwolf.github.io/imping-hook/
+
 ## Development
 
 Run all checks (formatting, clippy, tests, docs) from the repo root:
