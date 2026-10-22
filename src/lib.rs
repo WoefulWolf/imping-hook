@@ -1,7 +1,7 @@
-//! In-process function hooking for the imping modding suite.
+//! In-process function hooking for the imping toolkit.
 //!
 //! Installs typed function detours and code injections at arbitrary addresses
-//! in the running process, and depends on nothing else in the suite.
+//! in the running process, and depends on nothing else in imping.
 //! Relocation, near-memory allocation and thread-safe patching come from the
 //! [`detour`] crate, wrapped behind this crate's types.
 //!
