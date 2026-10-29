@@ -13,6 +13,8 @@ publish = false
 detour = "=0.10.0"
 # Allocates and protects the injection stub's memory.
 region = "4"
+# Finds code by byte pattern in a loaded module (`scan`).
+pelite = { version = "0.10", default-features = false, features = ["std"] }
 
 # Assembles the context stub and `asm` injections (x86-64 only). Already a
 # dependency of detour; `code_asm` adds the assembler.
@@ -21,13 +23,14 @@ version = "1"
 default-features = false
 features = ["std", "code_asm"]
 
-# Instruction-cache flush after writing the stub, and GetLastError. Other
-# platforms don't need the flush on x86.
+# Instruction-cache flush after writing the stub, GetLastError, and finding a
+# loaded module for `scan`. Other platforms don't need the flush on x86.
 [target.'cfg(windows)'.dependencies.windows-sys]
 version = "0.61"
 features = [
     "Win32_Foundation",
     "Win32_System_Diagnostics_Debug",
+    "Win32_System_LibraryLoader",
     "Win32_System_Threading",
 ]
 

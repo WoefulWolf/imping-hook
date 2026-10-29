@@ -9,6 +9,7 @@
 use crate::context::Context;
 use crate::error::{Error, OsError, Result};
 use crate::registry;
+use crate::scan::{Search, Target};
 use crate::sys;
 use core::mem::ManuallyDrop;
 use core::ptr;
@@ -244,7 +245,22 @@ impl Injection {
     ///
     /// Nothing is patched until [`install`](InjectionWith::install).
     pub fn at(target: *const ()) -> InjectionBuilder {
-        InjectionBuilder { target }
+        InjectionBuilder {
+            target: Target::Address(target),
+        }
+    }
+
+    /// Starts building an injection where a byte pattern matches.
+    ///
+    /// The pattern is searched for in the main module's code when the
+    /// injection is installed, and must match exactly once; see
+    /// [`scan`](crate::scan) for the syntax. Use
+    /// [`offset`](InjectionScan::offset) to land on an instruction inside the
+    /// match.
+    pub fn scan(pattern: &str) -> InjectionScan {
+        InjectionScan {
+            search: Search::new(pattern),
+        }
     }
 
     /// Enables the injection.
@@ -576,7 +592,7 @@ enum Payload {
 /// [`Injection::at`].
 #[must_use = "an injection builder does nothing until the payload and `install` are set"]
 pub struct InjectionBuilder {
-    target: *const (),
+    target: Target,
 }
 
 impl InjectionBuilder {
@@ -645,11 +661,87 @@ impl InjectionBuilder {
     }
 }
 
+/// An injection builder holding a byte pattern to find the target by, returned
+/// by [`Injection::scan`].
+#[must_use = "an injection builder does nothing until the payload and `install` are set"]
+pub struct InjectionScan {
+    search: Search,
+}
+
+impl InjectionScan {
+    /// Searches a loaded module such as `"engine.dll"` instead of the main
+    /// module.
+    pub fn in_module(self, module: &str) -> Self {
+        InjectionScan {
+            search: self.search.in_module(module),
+        }
+    }
+
+    /// Moves the target this many bytes on from the start of the match, or back
+    /// for a negative count.
+    pub fn offset(self, bytes: isize) -> Self {
+        InjectionScan {
+            search: self.search.offset(bytes),
+        }
+    }
+
+    /// Follows the `call` or `jmp` at the target to the code it goes to; see
+    /// [`HookScan::follow_call`](crate::HookScan::follow_call).
+    pub fn follow_call(self) -> Self {
+        InjectionScan {
+            search: self.search.follow_call(),
+        }
+    }
+
+    /// Injects the caller's own machine code; see [`InjectionBuilder::code`].
+    pub fn code(self, code: &[u8]) -> InjectionWith {
+        self.builder().code(code)
+    }
+
+    /// Injects machine code written as assembly; see [`InjectionBuilder::asm`].
+    #[cfg(target_arch = "x86_64")]
+    pub fn asm<F>(self, build: F) -> InjectionWith
+    where
+        F: FnOnce(
+                &mut crate::asm::CodeAssembler,
+            ) -> core::result::Result<(), crate::asm::IcedError>
+            + 'static,
+    {
+        self.builder().asm(build)
+    }
+
+    /// Injects a callback that reads the registers; see
+    /// [`InjectionBuilder::inspect`].
+    #[cfg(target_arch = "x86_64")]
+    pub fn inspect<F>(self, callback: F) -> InjectionWith
+    where
+        F: Fn(&Context) + Send + Sync + 'static,
+    {
+        self.builder().inspect(callback)
+    }
+
+    /// Injects a callback that can change the registers; see
+    /// [`InjectionBuilder::modify`].
+    #[cfg(target_arch = "x86_64")]
+    pub fn modify<F>(self, callback: F) -> InjectionWith
+    where
+        F: Fn(&mut Context) + Send + Sync + 'static,
+    {
+        self.builder().modify(callback)
+    }
+
+    fn builder(self) -> InjectionBuilder {
+        InjectionBuilder {
+            target: Target::Search(self.search),
+        }
+    }
+}
+
 /// An injection builder holding the target and what to inject, returned by the
-/// [`InjectionBuilder`] methods.
+/// [`InjectionBuilder`] and [`InjectionScan`] methods.
 #[must_use = "an injection builder does nothing until `install` is called"]
 pub struct InjectionWith {
-    target: *const (),
+    target: Target,
     payload: Payload,
 }
 
@@ -658,15 +750,20 @@ impl InjectionWith {
     ///
     /// # Errors
     ///
-    /// [`Error::AlreadyHooked`] if a detour or injection already holds the
-    /// address, [`Error::Assembly`] if [`asm`](InjectionBuilder::asm) code
-    /// can't be encoded, otherwise an error naming the target if it can't be
-    /// patched.
+    /// - The [`scan`](crate::scan) errors, for an injection built with
+    ///   [`Injection::scan`].
+    /// - [`Error::AlreadyHooked`] if a detour or injection already holds the
+    ///   address.
+    /// - [`Error::Assembly`] if [`asm`](InjectionBuilder::asm) code can't be
+    ///   encoded.
+    /// - Otherwise an error naming the target if it can't be patched.
     ///
     /// # Safety
     ///
-    /// - `target` must point to executable code whose first bytes can be
-    ///   relocated, and which can be resumed after the injected work.
+    /// - The target (the address given to [`Injection::at`], or what
+    ///   [`Injection::scan`] finds) must start an instruction in executable
+    ///   code whose first bytes can be relocated, and which can be resumed
+    ///   after the injected work.
     /// - Code from [`code`](InjectionBuilder::code) or
     ///   [`asm`](InjectionBuilder::asm) must follow the platform ABI: preserve
     ///   every register and flag the surrounding code relies on, keep the stack
@@ -674,7 +771,8 @@ impl InjectionWith {
     ///   x64), and not branch into the displaced bytes. Register-context
     ///   callbacks handle this themselves.
     pub unsafe fn install(self) -> Result<Injection> {
-        let address = self.target as usize;
+        let target = self.target.resolve()?;
+        let address = target as usize;
 
         // Claim the address up front so a second hook on it is refused.
         if !registry::claim(address) {
@@ -683,15 +781,13 @@ impl InjectionWith {
 
         let result = match self.payload {
             // SAFETY: forwarded from the caller.
-            Payload::Bytes(code) => unsafe { Injection::build_bytes(self.target, code) },
+            Payload::Bytes(code) => unsafe { Injection::build_bytes(target, code) },
             #[cfg(target_arch = "x86_64")]
             // SAFETY: forwarded from the caller.
-            Payload::Asm(build) => unsafe { Injection::build_asm(self.target, build) },
+            Payload::Asm(build) => unsafe { Injection::build_asm(target, build) },
             #[cfg(target_arch = "x86_64")]
             // SAFETY: forwarded from the caller.
-            Payload::Context(callback) => unsafe {
-                Injection::build_context(self.target, callback)
-            },
+            Payload::Context(callback) => unsafe { Injection::build_context(target, callback) },
         };
         if result.is_err() {
             registry::release(address);

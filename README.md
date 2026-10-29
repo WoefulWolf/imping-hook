@@ -26,6 +26,20 @@ assert_eq!(add(3, 2), 1); // runs `sub` now
 assert_eq!(hook.original().call(3, 2), 5);
 ```
 
+Or find the target by a byte pattern (`??` is any byte), in the main module or another one. `.offset(n)` steps to an instruction inside the match, and `.follow_call()` to the function a matched call goes to:
+
+```rust
+let hook = unsafe {
+    Hook::scan("48 89 5C 24 ?? 57 48 83 EC 20")
+        .in_module("engine.dll")
+        .redirect(my_detour as extern "C" fn(i32) -> i32)
+        .install()?
+};
+
+// Just the address, if that's all you need.
+let address = imping_hook::scan::find("48 89 5C 24 ?? 57")?;
+```
+
 Read or rewrite the registers at any address, then let the original code carry on:
 
 ```rust

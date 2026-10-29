@@ -36,6 +36,8 @@
 //!   the original callable. Its docs cover threads, batches and dropping.
 //! - [`Injection`] runs machine code, assembly or a register callback at an
 //!   address, then the original code.
+//! - [`scan`] finds code by a byte pattern; [`Hook::scan`] and
+//!   [`Injection::scan`] patch what it finds.
 //! - [`batch`] applies many enables and disables with one thread suspension.
 //! - [`Context`] holds the registers a register callback sees.
 //! - [`Error`] lists everything that can fail.
@@ -49,14 +51,15 @@ mod function;
 mod hook;
 mod inject;
 mod registry;
+pub mod scan;
 mod sys;
 
 pub use crate::batch::batch;
 pub use crate::context::{Context, Xmm};
 pub use crate::error::{Error, OsError, Result};
 pub use crate::function::{Function, Original};
-pub use crate::hook::{Hook, HookBuilder, HookWith};
-pub use crate::inject::{Injection, InjectionBuilder, InjectionWith};
+pub use crate::hook::{Hook, HookBuilder, HookScan, HookWith};
+pub use crate::inject::{Injection, InjectionBuilder, InjectionScan, InjectionWith};
 
 /// Re-exports the assembler used by
 /// [`InjectionBuilder::asm`](crate::InjectionBuilder::asm).

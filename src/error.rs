@@ -5,9 +5,11 @@ use core::fmt;
 /// The result of a hooking operation.
 pub type Result<T> = core::result::Result<T, Error>;
 
-/// Everything that can go wrong when installing, enabling or disabling a hook.
+/// Everything that can go wrong when finding, installing, enabling or disabling
+/// a hook.
 ///
-/// Variants about a specific location carry its `address`, which the
+/// Variants about a specific location carry its `address`, and those about a
+/// [`scan`](crate::scan) its pattern or module, which the
 /// [`Display`](fmt::Display) message names.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -71,6 +73,31 @@ pub enum Error {
     /// An operating system call failed, such as changing memory protection or
     /// suspending a thread.
     Os(OsError),
+    /// A [`scan`](crate::scan) pattern can't be parsed, or doesn't spell out the
+    /// call that [`follow_call`](crate::HookScan::follow_call) needs.
+    InvalidPattern {
+        /// The pattern as given.
+        pattern: String,
+        /// The byte position in `pattern` where it goes wrong.
+        position: usize,
+    },
+    /// A pattern matched nowhere in the module's code.
+    PatternNotFound {
+        /// The pattern as given.
+        pattern: String,
+    },
+    /// A pattern matched more than once, so it can't tell which place is meant.
+    PatternNotUnique {
+        /// The pattern as given.
+        pattern: String,
+        /// How many times it matched.
+        matches: usize,
+    },
+    /// No loaded module has the name a scan was given.
+    ModuleNotFound {
+        /// The module name as given.
+        name: String,
+    },
 }
 
 impl fmt::Display for Error {
@@ -113,6 +140,16 @@ impl fmt::Display for Error {
                 )
             }
             Error::Os(_) => f.write_str("an operating system call failed"),
+            Error::InvalidPattern { pattern, position } => {
+                write!(f, "pattern `{pattern}` is invalid at position {position}")
+            }
+            Error::PatternNotFound { pattern } => {
+                write!(f, "pattern `{pattern}` matched nothing")
+            }
+            Error::PatternNotUnique { pattern, matches } => {
+                write!(f, "pattern `{pattern}` matched {matches} places, not one")
+            }
+            Error::ModuleNotFound { name } => write!(f, "module `{name}` is not loaded"),
         }
     }
 }

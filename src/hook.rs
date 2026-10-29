@@ -3,12 +3,14 @@
 use crate::error::{Error, Result};
 use crate::function::Function;
 use crate::registry;
+use crate::scan::{Search, Target};
 
 /// A typed function detour, and the RAII guard that owns it.
 ///
 /// While enabled, calls to the target run a detour of the same signature `F`
 /// instead; the original stays callable through [`original`](Self::original).
-/// Build one with [`Hook::at`].
+/// Build one with [`Hook::at`], or [`Hook::scan`] to find the target by a byte
+/// pattern.
 ///
 /// # Threads
 ///
@@ -71,6 +73,34 @@ impl Hook {
     /// Nothing is patched until [`install`](HookWith::install).
     pub fn at(target: *const ()) -> HookBuilder {
         HookBuilder { target }
+    }
+
+    /// Starts building a hook of the function a byte pattern finds.
+    ///
+    /// The pattern is searched for in the main module's code when the hook is
+    /// installed, and must match exactly once; see [`scan`](crate::scan) for
+    /// the syntax.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use imping_hook::Hook;
+    /// # extern "C" fn my_detour(a: i32) -> i32 { a }
+    /// # fn main() -> imping_hook::Result<()> {
+    /// // SAFETY: the pattern finds a function with the detour's signature.
+    /// let hook = unsafe {
+    ///     Hook::scan("48 89 5C 24 ?? 57 48 83 EC 20")
+    ///         .in_module("engine.dll")
+    ///         .redirect(my_detour as extern "C" fn(i32) -> i32)
+    ///         .install()?
+    /// };
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn scan(pattern: &str) -> HookScan {
+        HookScan {
+            search: Search::new(pattern),
+        }
     }
 }
 
@@ -240,17 +270,63 @@ impl HookBuilder {
     /// signature `F`.
     pub fn redirect<F: Function>(self, detour: F) -> HookWith<F> {
         HookWith {
-            target: self.target,
+            target: Target::Address(self.target),
+            detour,
+        }
+    }
+}
+
+/// A hook builder holding a byte pattern to find the target by, returned by
+/// [`Hook::scan`].
+#[must_use = "a hook builder does nothing until `redirect` and `install` are called"]
+pub struct HookScan {
+    search: Search,
+}
+
+impl HookScan {
+    /// Searches a loaded module such as `"engine.dll"` instead of the main
+    /// module.
+    pub fn in_module(self, module: &str) -> Self {
+        HookScan {
+            search: self.search.in_module(module),
+        }
+    }
+
+    /// Moves the target this many bytes on from the start of the match, or back
+    /// for a negative count.
+    pub fn offset(self, bytes: isize) -> Self {
+        HookScan {
+            search: self.search.offset(bytes),
+        }
+    }
+
+    /// Follows the `call` or `jmp` at the target to the function it goes to.
+    ///
+    /// For a pattern that matches a call site rather than the function itself.
+    /// The pattern must spell out the instruction's `E8` (call) or `E9` (jmp)
+    /// opcode at the offset, and cover its 4-byte displacement, which may be
+    /// wildcards: `"E8 ?? ?? ?? ?? 48 8B D8"`.
+    pub fn follow_call(self) -> Self {
+        HookScan {
+            search: self.search.follow_call(),
+        }
+    }
+
+    /// Sets the detour to redirect the target to, which fixes the hook's
+    /// signature `F`.
+    pub fn redirect<F: Function>(self, detour: F) -> HookWith<F> {
+        HookWith {
+            target: Target::Search(self.search),
             detour,
         }
     }
 }
 
 /// A hook builder holding the target and detour, returned by
-/// [`HookBuilder::redirect`].
+/// [`HookBuilder::redirect`] and [`HookScan::redirect`].
 #[must_use = "a hook builder does nothing until `install` is called"]
 pub struct HookWith<F: Function> {
-    target: *const (),
+    target: Target,
     detour: F,
 }
 
@@ -262,16 +338,21 @@ impl<F: Function> HookWith<F> {
     ///
     /// # Errors
     ///
-    /// [`Error::AlreadyHooked`] if a detour or injection already holds the
-    /// address; otherwise an error naming the target if it can't be patched.
+    /// - The [`scan`](crate::scan) errors, for a hook built with
+    ///   [`Hook::scan`].
+    /// - [`Error::AlreadyHooked`] if a detour or injection already holds the
+    ///   address.
+    /// - Otherwise an error naming the target if it can't be patched.
     ///
     /// # Safety
     ///
-    /// - `target` must point to a function with signature `F`, not one the
-    ///   compiler may have inlined into all its callers.
+    /// - The target (the address given to [`Hook::at`], or what
+    ///   [`Hook::scan`] finds) must be a function with signature `F`, not one
+    ///   the compiler may have inlined into all its callers.
     /// - The detour must match that signature and calling convention.
     pub unsafe fn install(self) -> Result<Hook<F>> {
-        let address = self.target as usize;
+        let target = self.target.resolve()?;
+        let address = target as usize;
 
         // Claim the address up front so a second hook on it is refused.
         if !registry::claim(address) {
@@ -279,7 +360,7 @@ impl<F: Function> HookWith<F> {
         }
 
         // SAFETY: the caller guarantees `target` is a function of signature `F`.
-        let target_fn: F = unsafe { F::from_ptr(self.target) };
+        let target_fn: F = unsafe { F::from_ptr(target) };
 
         // SAFETY: the target and detour share the signature `F`.
         match unsafe { detour::TypedDetour::<F>::new(target_fn, self.detour) } {
