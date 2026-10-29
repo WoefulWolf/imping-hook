@@ -5,7 +5,8 @@
 //!
 //! Run with: `cargo run --example scan_hook`
 
-use imping_hook::{Hook, scan};
+use imping_hook::Hook;
+use imping_hook::scan::{self, Pattern};
 
 #[inline(never)]
 extern "C" fn add(a: i32, b: i32) -> i32 {
@@ -16,12 +17,13 @@ extern "C" fn sub(a: i32, b: i32) -> i32 {
     a - b
 }
 
-/// Grows a pattern of `add`'s first bytes until it matches only `add`.
-fn pattern_of_add() -> String {
+/// Grows a pattern of the code at `at` until it matches only there.
+fn pattern_at(at: *const u8) -> String {
     (8..=64)
         .map(|len| {
-            // SAFETY: `add` is followed by more code in this executable.
-            let bytes = unsafe { std::slice::from_raw_parts(add as *const u8, len) };
+            // SAFETY: `at` is inside `add`, which is followed by more code in
+            // this executable.
+            let bytes = unsafe { std::slice::from_raw_parts(at, len) };
             bytes
                 .iter()
                 .map(|b| format!("{b:02X}"))
@@ -33,12 +35,20 @@ fn pattern_of_add() -> String {
 }
 
 fn main() -> imping_hook::Result<()> {
-    let pattern = pattern_of_add();
+    let pattern = pattern_at(add as *const u8);
     println!("pattern: {pattern}");
     println!(
         "found at {:p}, add is at {:p}",
         scan::find(&pattern)?,
         add as *const ()
+    );
+
+    // A pattern from inside `add`, stepped back to its start.
+    // SAFETY: `add` is longer than four bytes.
+    let inner = pattern_at(unsafe { (add as *const u8).add(4) });
+    println!(
+        "stepped back to {:p}",
+        Pattern::new(&inner).offset(-4).find()?
     );
 
     // SAFETY: the pattern finds `add`, and `sub` shares its signature.

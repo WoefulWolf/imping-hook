@@ -1,7 +1,8 @@
 //! Finds functions in this test executable by their own bytes, then hooks and
 //! injects at what the scan finds.
 
-use imping_hook::{Error, Hook, scan};
+use imping_hook::scan::{self, Pattern};
+use imping_hook::{Error, Hook};
 
 #[inline(never)]
 extern "C" fn found(a: u64) -> u64 {
@@ -135,9 +136,9 @@ fn hooks_what_a_scan_finds_with_an_offset() {
     assert_eq!(hooked(7), before);
 }
 
-#[test]
-fn follows_a_call_to_its_target() {
-    // Find `caller`'s call to `callee`, then pattern the bytes just before it.
+/// Finds `caller`'s call to `callee` and returns a pattern of the bytes just
+/// before it, plus how far into the pattern the call is.
+fn call_pattern() -> (String, usize) {
     let start = caller as *const u8;
     // SAFETY: `caller` is at least 128 bytes away from the end of the code.
     let code = unsafe { std::slice::from_raw_parts(start, 128) };
@@ -158,8 +159,29 @@ fn follows_a_call_to_its_target() {
             break;
         }
     }
-    let (pattern, before) = pattern.expect("a unique pattern before the call");
+    pattern.expect("a unique pattern before the call")
+}
 
+#[test]
+fn a_pattern_steps_from_its_match() {
+    // SAFETY: `found` is longer than four bytes.
+    let inner = unique_pattern(unsafe { (found as *const u8).add(4) });
+    assert_eq!(
+        Pattern::new(&inner).offset(-4).find(),
+        Ok(found as *const ())
+    );
+
+    let (call, before) = call_pattern();
+    let found = Pattern::new(&call)
+        .offset(before as isize)
+        .follow_call()
+        .find();
+    assert_eq!(found, Ok(callee as *const ()));
+}
+
+#[test]
+fn follows_a_call_to_its_target() {
+    let (pattern, before) = call_pattern();
     // SAFETY: the pattern's call goes to `callee`, which shares the
     // replacement's signature.
     let hook = unsafe {

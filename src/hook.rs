@@ -3,7 +3,7 @@
 use crate::error::{Error, Result};
 use crate::function::Function;
 use crate::registry;
-use crate::scan::{Search, Target};
+use crate::scan::{Pattern, Target};
 
 /// A typed function detour, and the RAII guard that owns it.
 ///
@@ -99,7 +99,7 @@ impl Hook {
     /// ```
     pub fn scan(pattern: &str) -> HookScan {
         HookScan {
-            search: Search::new(pattern),
+            pattern: Pattern::new(pattern),
         }
     }
 }
@@ -280,7 +280,7 @@ impl HookBuilder {
 /// [`Hook::scan`].
 #[must_use = "a hook builder does nothing until `redirect` and `install` are called"]
 pub struct HookScan {
-    search: Search,
+    pattern: Pattern,
 }
 
 impl HookScan {
@@ -288,7 +288,7 @@ impl HookScan {
     /// module.
     pub fn in_module(self, module: &str) -> Self {
         HookScan {
-            search: self.search.in_module(module),
+            pattern: self.pattern.in_module(module),
         }
     }
 
@@ -296,19 +296,15 @@ impl HookScan {
     /// for a negative count.
     pub fn offset(self, bytes: isize) -> Self {
         HookScan {
-            search: self.search.offset(bytes),
+            pattern: self.pattern.offset(bytes),
         }
     }
 
-    /// Follows the `call` or `jmp` at the target to the function it goes to.
-    ///
-    /// For a pattern that matches a call site rather than the function itself.
-    /// The pattern must spell out the instruction's `E8` (call) or `E9` (jmp)
-    /// opcode at the offset, and cover its 4-byte displacement, which may be
-    /// wildcards: `"E8 ?? ?? ?? ?? 48 8B D8"`.
+    /// Follows the `call` or `jmp` at the target to the function it goes to;
+    /// see [`Pattern::follow_call`].
     pub fn follow_call(self) -> Self {
         HookScan {
-            search: self.search.follow_call(),
+            pattern: self.pattern.follow_call(),
         }
     }
 
@@ -316,7 +312,7 @@ impl HookScan {
     /// signature `F`.
     pub fn redirect<F: Function>(self, detour: F) -> HookWith<F> {
         HookWith {
-            target: Target::Search(self.search),
+            target: Target::Pattern(self.pattern),
             detour,
         }
     }

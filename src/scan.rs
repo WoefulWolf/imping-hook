@@ -3,8 +3,10 @@
 //! A pattern is hex bytes separated by spaces, with `?` or `??` for any byte:
 //! `"48 89 5C 24 ?? 57"`. It's searched for in a loaded module's executable
 //! sections and must match exactly once, so a pattern that no longer fits the
-//! program fails instead of landing somewhere else. [`Hook::scan`] and
-//! [`Injection::scan`] patch what a pattern finds.
+//! program fails instead of landing somewhere else. [`find`] and [`find_in`]
+//! are the short way, [`Pattern`] can also step from the match to an address
+//! near it, and [`Hook::scan`] and [`Injection::scan`] patch what a pattern
+//! finds.
 //!
 //! [`Hook::scan`]: crate::Hook::scan
 //! [`Injection::scan`]: crate::Injection::scan
@@ -12,8 +14,12 @@
 //! # Examples
 //!
 //! ```no_run
-//! let address = imping_hook::scan::find("48 89 5C 24 ?? 57 48 83 EC 20")?;
-//! let address = imping_hook::scan::find_in("engine.dll", "48 89 5C 24 ?? 57")?;
+//! use imping_hook::scan::{self, Pattern};
+//!
+//! let address = scan::find("48 89 5C 24 ?? 57 48 83 EC 20")?;
+//! let address = scan::find_in("engine.dll", "48 89 5C 24 ?? 57")?;
+//! // The function a matched call goes to.
+//! let address = Pattern::new("E8 ?? ?? ?? ?? 48 8B D8").follow_call().find()?;
 //! # Ok::<(), imping_hook::Error>(())
 //! ```
 
@@ -30,7 +36,7 @@ use pelite::pe::{Pe, PeView};
 /// - [`Error::PatternNotFound`] or [`Error::PatternNotUnique`] unless it
 ///   matches exactly once.
 pub fn find(pattern: &str) -> Result<*const ()> {
-    Search::new(pattern).locate()
+    Pattern::new(pattern).find()
 }
 
 /// Finds the one place in a loaded module's code that `pattern` matches.
@@ -43,36 +49,60 @@ pub fn find(pattern: &str) -> Result<*const ()> {
 /// As for [`find`], plus [`Error::ModuleNotFound`] if no module of that name is
 /// loaded.
 pub fn find_in(module: &str, pattern: &str) -> Result<*const ()> {
-    Search::new(pattern).in_module(module).locate()
+    Pattern::new(pattern).in_module(module).find()
 }
 
-/// Where a hook or injection goes: an address, or the result of a search.
+/// Where a hook or injection goes: an address, or a pattern to find it by.
 pub(crate) enum Target {
     Address(*const ()),
-    Search(Search),
+    Pattern(Pattern),
 }
 
 impl Target {
-    /// Returns the address, running the search if there is one.
+    /// Returns the address, searching for the pattern if there is one.
     pub(crate) fn resolve(self) -> Result<*const ()> {
         match self {
             Target::Address(address) => Ok(address),
-            Target::Search(search) => search.locate(),
+            Target::Pattern(pattern) => pattern.find(),
         }
     }
 }
 
-/// A pattern search, plus what to do with its match.
-pub(crate) struct Search {
+/// A byte pattern to find, where to look for it, and how to get from the match
+/// to the address wanted.
+///
+/// See the [module docs](self) for the syntax.
+///
+/// # Examples
+///
+/// ```no_run
+/// use imping_hook::scan::Pattern;
+///
+/// // The match starts four bytes into the function.
+/// let function = Pattern::new("48 83 EC 20 33 DB").offset(-4).find()?;
+/// // The function called at the match, in another module.
+/// let callee = Pattern::new("E8 ?? ?? ?? ?? 48 8B D8")
+///     .in_module("engine.dll")
+///     .follow_call()
+///     .find()?;
+/// # Ok::<(), imping_hook::Error>(())
+/// ```
+#[derive(Debug, Clone)]
+#[must_use = "a pattern does nothing until `find` is called"]
+pub struct Pattern {
     pattern: String,
     module: Option<String>,
     offset: isize,
     follow_call: bool,
 }
 
-impl Search {
-    pub(crate) fn new(pattern: &str) -> Self {
-        Search {
+impl Pattern {
+    /// Creates a pattern to find in the main module, such as
+    /// `"48 89 5C 24 ?? 57"`.
+    ///
+    /// It's parsed by [`find`](Self::find).
+    pub fn new(pattern: &str) -> Self {
+        Pattern {
             pattern: pattern.to_owned(),
             module: None,
             offset: 0,
@@ -80,23 +110,44 @@ impl Search {
         }
     }
 
-    pub(crate) fn in_module(mut self, module: &str) -> Self {
+    /// Searches a loaded module such as `"engine.dll"` instead of the main
+    /// module.
+    pub fn in_module(mut self, module: &str) -> Self {
         self.module = Some(module.to_owned());
         self
     }
 
-    pub(crate) fn offset(mut self, bytes: isize) -> Self {
+    /// Moves the address this many bytes on from the start of the match, or
+    /// back for a negative count.
+    pub fn offset(mut self, bytes: isize) -> Self {
         self.offset = bytes;
         self
     }
 
-    pub(crate) fn follow_call(mut self) -> Self {
+    /// Follows the `call` or `jmp` at the address to where it goes.
+    ///
+    /// For a pattern that matches a call site rather than the function itself.
+    /// The pattern must spell out the instruction's `E8` (call) or `E9` (jmp)
+    /// opcode at the offset, and cover its 4-byte displacement, which may be
+    /// wildcards: `"E8 ?? ?? ?? ?? 48 8B D8"`.
+    pub fn follow_call(mut self) -> Self {
         self.follow_call = true;
         self
     }
 
-    /// Runs the search and returns the address it points at.
-    pub(crate) fn locate(&self) -> Result<*const ()> {
+    /// Finds the one place the pattern matches and returns the address it
+    /// leads to.
+    ///
+    /// The module must stay loaded while it's searched.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidPattern`] if the pattern can't be parsed, or doesn't
+    ///   spell out the call for [`follow_call`](Self::follow_call).
+    /// - [`Error::PatternNotFound`] or [`Error::PatternNotUnique`] unless it
+    ///   matches exactly once.
+    /// - [`Error::ModuleNotFound`] if the module isn't loaded.
+    pub fn find(&self) -> Result<*const ()> {
         let bytes = parse(&self.pattern)?;
         if self.follow_call {
             self.check_call(&bytes)?;
@@ -243,7 +294,7 @@ mod tests {
 
     #[test]
     fn follow_call_needs_the_whole_call() {
-        let check = |pattern: &str, offset| Search::new(pattern).offset(offset).follow_call();
+        let check = |pattern: &str, offset| Pattern::new(pattern).offset(offset).follow_call();
         assert!(
             check("E8 ?? ?? ?? ??", 0)
                 .check_call(&parse("E8 ?? ?? ?? ??").unwrap())

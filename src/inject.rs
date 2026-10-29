@@ -9,7 +9,7 @@
 use crate::context::Context;
 use crate::error::{Error, OsError, Result};
 use crate::registry;
-use crate::scan::{Search, Target};
+use crate::scan::{Pattern, Target};
 use crate::sys;
 use core::mem::ManuallyDrop;
 use core::ptr;
@@ -259,7 +259,7 @@ impl Injection {
     /// match.
     pub fn scan(pattern: &str) -> InjectionScan {
         InjectionScan {
-            search: Search::new(pattern),
+            pattern: Pattern::new(pattern),
         }
     }
 
@@ -665,7 +665,7 @@ impl InjectionBuilder {
 /// by [`Injection::scan`].
 #[must_use = "an injection builder does nothing until the payload and `install` are set"]
 pub struct InjectionScan {
-    search: Search,
+    pattern: Pattern,
 }
 
 impl InjectionScan {
@@ -673,7 +673,7 @@ impl InjectionScan {
     /// module.
     pub fn in_module(self, module: &str) -> Self {
         InjectionScan {
-            search: self.search.in_module(module),
+            pattern: self.pattern.in_module(module),
         }
     }
 
@@ -681,15 +681,15 @@ impl InjectionScan {
     /// for a negative count.
     pub fn offset(self, bytes: isize) -> Self {
         InjectionScan {
-            search: self.search.offset(bytes),
+            pattern: self.pattern.offset(bytes),
         }
     }
 
     /// Follows the `call` or `jmp` at the target to the code it goes to; see
-    /// [`HookScan::follow_call`](crate::HookScan::follow_call).
+    /// [`Pattern::follow_call`].
     pub fn follow_call(self) -> Self {
         InjectionScan {
-            search: self.search.follow_call(),
+            pattern: self.pattern.follow_call(),
         }
     }
 
@@ -732,7 +732,7 @@ impl InjectionScan {
 
     fn builder(self) -> InjectionBuilder {
         InjectionBuilder {
-            target: Target::Search(self.search),
+            target: Target::Pattern(self.pattern),
         }
     }
 }
